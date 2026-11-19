@@ -1,0 +1,221 @@
+import { mkdirSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { cleanGitHubEnvironment } from "../github/auth.ts";
+import type { AgentIdentity, RunnerProvider, ThreadSession } from "../session/types.ts";
+
+export interface RunnerRuntimeOptions {
+  session: ThreadSession;
+  targetRepoCwd?: string;
+  botToken?: string;
+  agentIdentity?: AgentIdentity;
+  githubAuthEnv?: Record<string, string>;
+}
+
+export interface RunnerRuntime {
+  cwd: string;
+  needsProjectMcp: boolean;
+  env: Record<string, string>;
+}
+
+export const WORKFLOW_UTILITY_CWD = "/tmp/junior-utility";
+
+export const DATABASE_CREDENTIAL_ENV_KEYS = [
+  "MDB_MCP_CONNECTIONS",
+  "MDB_MCP_CONNECTION_STRING",
+  "DB_STRING",
+  "MONGODB_URI",
+  "MONGO_URI",
+  "MONGODB_URL",
+  "MONGO_URL",
+] as const;
+
+/**
+ * Credentials which belong to Junior's control plane rather than a text-only
+ * child process.  Keep these as explicit empty values at the process boundary:
+ * Bun loads dotenv files after it receives an environment, so deleting a key
+ * can let a hostile cwd rehydrate it from `.env`.
+ */
+export const STERILE_RUNNER_SECRET_ENV_KEYS = [
+  "MCP_CONTEXT_SECRET",
+  "SLACK_BOT_TOKEN",
+  "SLACK_APP_TOKEN",
+  "SLACK_SIGNING_SECRET",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_RECONCILE_TOKEN",
+  "MIXPANEL_MCP_TOKEN",
+  "MIXPANEL_MCP_US_TOKEN",
+  "MIXPANEL_MCP_EU_TOKEN",
+  "MIXPANEL_MCP_IN_TOKEN",
+  ...DATABASE_CREDENTIAL_ENV_KEYS,
+] as const;
+
+/**
+ * Build a fresh child environment for untrusted, text-only runner work.
+ *
+ * Authentication for the model CLIs may still come from their ordinary user
+ * state, but Junior's Slack, GitHub, MCP-signing, and database credentials are
+ * never useful to a pre-recall subprocess.  Do not omit these keys: an empty
+ * sentinel wins over a dotenv value discovered in the child's cwd.
+ */
+export function buildSterileRunnerEnv(
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env = { ...parentEnv } as Record<string, string>;
+  for (const key of STERILE_RUNNER_SECRET_ENV_KEYS) env[key] = "";
+  return env;
+}
+
+/**
+ * Whether this provider invocation will resume a prior model session.
+ *
+ * Prompt construction must inject bounded thread/assignment/artifact/memory
+ * context whenever this returns false — a stored session ID alone is not proof
+ * of resume when the provider has continuity disabled (OpenCode default).
+ */
+export function willResume(options: {
+  provider: RunnerProvider;
+  sessionId: string | null | undefined;
+  opencodeContinuityEnabled: boolean;
+}): boolean {
+  const sessionId = options.sessionId?.trim();
+  if (!sessionId) return false;
+
+  switch (options.provider) {
+    case "opencode":
+    case "opencode-sdk":
+      return options.opencodeContinuityEnabled;
+    case "claude":
+    case "codex":
+    case "codex-app-server":
+      return true;
+    default: {
+      const _exhaustive: never = options.provider;
+      return _exhaustive;
+    }
+  }
+}
+
+export function buildRunnerRuntime(options: RunnerRuntimeOptions): RunnerRuntime {
+  const {
+    session,
+    targetRepoCwd,
+    botToken,
+    agentIdentity,
+    githubAuthEnv,
+  } = options;
+  const cwd = resolveRunnerCwd(session, targetRepoCwd);
+  if (session.cwd) mkdirSync(session.cwd, { recursive: true });
+
+  return {
+    cwd,
+    needsProjectMcp: needsProjectMcp(session, cwd),
+    env: buildRunnerEnv(session, botToken, agentIdentity, githubAuthEnv),
+  };
+}
+
+export function resolveRunnerCwd(
+  session: ThreadSession,
+  targetRepoCwd?: string,
+): string {
+  return session.cwd ?? session.worktreePath ?? targetRepoCwd ?? process.cwd();
+}
+
+/**
+ * Claude stores conversations under a cwd-derived project directory. A
+ * session id that exists under one checkout is not resumable from another.
+ * Unknown legacy affinity fails closed so the next turn establishes a fresh,
+ * correctly-scoped provider session.
+ */
+export function providerSessionMatchesCwd(options: {
+  provider: RunnerProvider;
+  sessionId: string | null | undefined;
+  sessionCwd: string | null | undefined;
+  cwd: string;
+}): boolean {
+  if (!options.sessionId?.trim()) return true;
+  if (options.provider !== "claude") return true;
+  if (!options.sessionCwd?.trim()) return false;
+  return normalizeProviderSessionCwd(options.sessionCwd) ===
+    normalizeProviderSessionCwd(options.cwd);
+}
+
+export function normalizeProviderSessionCwd(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+export function isProviderSessionUnavailable(
+  provider: RunnerProvider,
+  error: string | null | undefined,
+): boolean {
+  const normalized = (error ?? "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+  return provider === "claude" &&
+    /No conversation found with session ID\b\s*:?/i.test(normalized);
+}
+
+export function needsProjectMcp(session: ThreadSession, cwd: string): boolean {
+  // Claude-specific project .mcp.json policy: Claude auto-loads project MCPs
+  // from Junior's root, so it only needs --mcp-config for off-root/worktree
+  // runs. OpenCode generates its MCP config on every normal spawn and uses a
+  // different predicate in src/opencode/spawner.ts.
+  return !session.cwd && cwd !== process.cwd();
+}
+
+export function buildRunnerEnv(
+  session: ThreadSession,
+  botToken?: string,
+  agentIdentity?: AgentIdentity,
+  githubAuthEnv?: Record<string, string>,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    ...cleanGitHubEnvironment({ isolatedConfig: true }),
+    JUNIOR_SPAWNED: "1",
+    SLACK_CHANNEL: session.channel,
+    SLACK_THREAD_TS: session.threadId,
+    JUNIOR_AGENT_NAME: session.activeAgentName ?? "default",
+    ...(botToken ? { SLACK_BOT_TOKEN: botToken } : {}),
+  };
+  if (githubAuthEnv) {
+    Object.assign(env, githubAuthEnv);
+  }
+  // Empty sentinels prevent Bun-launched providers from reloading credentials
+  // from a target repository's dotenv file. A verified GH_TOKEN above is the
+  // sole exception.
+  if (!githubAuthEnv?.GH_TOKEN) env.GH_TOKEN = "";
+  env.GITHUB_TOKEN = "";
+  env.GH_ENTERPRISE_TOKEN = "";
+  env.GITHUB_RECONCILE_TOKEN = "";
+  // MCP_CONTEXT_SECRET authenticates the agent identity embedded in MCP URLs.
+  // A child that receives it could forge a different agent's capability token.
+  delete env.MCP_CONTEXT_SECRET;
+  // Database credentials belong to Junior's MCP backend, never to spawned
+  // coding agents. Keep explicit empty sentinels instead of deleting the keys:
+  // Bun otherwise reloads values from the runner cwd's .env in descendants.
+  for (const key of DATABASE_CREDENTIAL_ENV_KEYS) env[key] = "";
+
+  if (agentIdentity) {
+    env.JUNIOR_SLACK_USERNAME = agentIdentity.username;
+    if (agentIdentity.iconEmoji) {
+      env.JUNIOR_SLACK_ICON_EMOJI = agentIdentity.iconEmoji;
+      delete env.JUNIOR_SLACK_ICON_URL;
+    } else if (agentIdentity.imageUrl) {
+      env.JUNIOR_SLACK_ICON_URL = agentIdentity.imageUrl;
+      delete env.JUNIOR_SLACK_ICON_EMOJI;
+    } else {
+      delete env.JUNIOR_SLACK_ICON_EMOJI;
+      delete env.JUNIOR_SLACK_ICON_URL;
+    }
+  } else {
+    delete env.JUNIOR_SLACK_USERNAME;
+    delete env.JUNIOR_SLACK_ICON_EMOJI;
+    delete env.JUNIOR_SLACK_ICON_URL;
+  }
+
+  return env;
+}

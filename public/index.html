@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Junior — Dashboard</title>
+<link rel="stylesheet" href="/assets/dashboard.css" />
+</head>
+
+<body>
+  <aside>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-copy"><h1>JUNIOR</h1><span class="brand-sub">operator console</span></span>
+      <span class="env">local</span>
+    </div>
+    <nav id="nav" aria-label="Dashboard views">
+      <a href="#overview" data-view="overview"><span class="ico">◉</span>Overview</a>
+      <a href="#threads" data-view="threads"><span class="ico">≡</span>Threads<span class="count" id="nav-threads" style="display:none"></span></a>
+      <a href="#logs" data-view="logs"><span class="ico">▤</span>Logs<span class="count err" id="nav-logs" style="display:none"></span></a>
+      <a href="#devservers" data-view="devservers"><span class="ico">▶</span>Dev Servers<span class="count" id="nav-ds" style="display:none"></span></a>
+      <a href="#workflows" data-view="workflows"><span class="ico">↻</span>Workflows<span class="count" id="nav-wf" style="display:none"></span></a>
+      <a href="#pipelines" data-view="pipelines"><span class="ico">◇</span>Pipelines<span class="count hot" id="nav-pipelines" style="display:none"></span></a>
+      <a href="#runbooks" data-view="runbooks"><span class="ico">▣</span>Runbooks<span class="count" id="nav-runbooks" style="display:none"></span></a>
+      <a href="#spend" data-view="spend"><span class="ico">$</span>Spend<span class="count" id="nav-spend" style="display:none"></span></a>
+      <a href="#profiles" data-view="profiles"><span class="ico">◎</span>Profiles<span class="count" id="nav-profiles" style="display:none"></span></a>
+      <a href="#memory" data-view="memory"><span class="ico">✦</span>Memory</a>
+      <a href="#docs" data-view="docs"><span class="ico">¶</span>Docs</a>
+      <a href="#audit" data-view="audit"><span class="ico">⌗</span>Audit<span class="count" id="nav-audit" style="display:none"></span></a>
+    </nav>
+    <div class="side-foot" id="side-foot">
+      v<b id="sf-version">—</b> · up <b id="sf-uptime">—</b><br />
+      repos <b id="sf-repos">—</b>
+      <div class="live-toggle" id="live-toggle">
+        <span class="live-dot" id="live-dot"></span>
+        <span id="live-label">live · 2s poll</span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="content">
+
+    <!-- ================= OVERVIEW ================= -->
+    <section class="view" id="view-overview">
+      <div class="view-head" data-index="01">
+        <h2>Overview</h2>
+        <span class="sub">what needs you, then the numbers</span>
+        <span class="right mono faint" id="ov-refreshed">—</span>
+      </div>
+
+      <h3 class="sect" id="attn-sect">Needs attention</h3>
+      <div class="attn" id="attn"></div>
+      <div class="attn-ok" id="attn-ok">✓ all quiet — no errors, stuck sessions, or queue waiters</div>
+
+      <h3 class="sect">Right now</h3>
+      <div class="stat-grid" id="ov-stats"><div class="empty">loading…</div></div>
+
+      <div id="act-section" style="display:none">
+        <h3 class="sect">Turns per hour · today</h3>
+        <div class="panel act-wrap">
+          <div class="act-chart" id="act-chart"></div>
+          <div class="act-x"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          <div class="tip" id="act-tip"></div>
+        </div>
+      </div>
+
+      <div class="two-col" style="margin-top: 26px">
+        <div>
+          <h3 class="sect">Recent warnings &amp; errors</h3>
+          <div class="panel" id="ov-feed"><div class="empty">loading…</div></div>
+        </div>
+        <div>
+          <h3 class="sect">Busiest threads</h3>
+          <div class="panel" id="ov-busiest"><div class="empty">loading…</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= THREADS ================= -->
+    <section class="view" id="view-threads">
+      <div class="view-head" data-index="02">
+        <h2>Threads</h2>
+        <span class="sub">click a row for full session detail</span>
+        <span class="right"><input class="search" id="th-search" placeholder="filter channel / thread / repo…" /></span>
+      </div>
+      <div class="chips" id="th-chips" style="margin-bottom: 14px"></div>
+      <div class="panel" id="th-list"><div class="empty">loading…</div></div>
+    </section>
+
+    <!-- ================= LOGS ================= -->
+    <section class="view" id="view-logs">
+      <div class="view-head" data-index="03">
+        <h2>Logs</h2>
+        <span class="sub">logs/&lt;date&gt;.log — parsed, filterable, no more ssh + tail</span>
+      </div>
+      <div class="log-toolbar">
+        <input type="date" class="ctrl" id="log-date" />
+        <select class="ctrl" id="log-tag">
+          <option value="">all tags</option>
+          <option>session</option><option>spawner</option><option>slack</option>
+          <option>worktree</option><option>devserver</option><option>http</option><option>memory</option>
+          <option>boot</option><option>workflow</option>
+        </select>
+        <span class="chips" id="log-levels">
+          <span class="chip on" data-lv="">all</span>
+          <span class="chip" data-lv="INFO">info</span>
+          <span class="chip" data-lv="WARN">warn</span>
+          <span class="chip" data-lv="ERROR">error</span>
+        </span>
+        <input class="search" id="log-search" placeholder="grep…" style="width: 170px" />
+        <span style="margin-left:auto; display:flex; gap:8px">
+          <button class="ctrl follow-btn on" id="log-follow" type="button">● follow</button>
+          <button class="ctrl" id="log-clear" type="button">clear filters</button>
+        </span>
+      </div>
+      <div class="panel log-scroll" id="log-scroll">
+        <div class="log-lines" id="log-lines"><div class="empty">loading…</div></div>
+      </div>
+      <div class="faint mono" style="margin-top:calc(8 * var(--baseline-font)); font-size:calc(11 * var(--baseline-font))" id="log-count"></div>
+    </section>
+
+    <!-- ================= DEV SERVERS ================= -->
+    <section class="view" id="view-devservers">
+      <div class="view-head" data-index="04">
+        <h2>Dev Servers</h2>
+        <span class="sub">one slot per repo · TTL meter shows time until idle reap</span>
+      </div>
+      <div class="ds-grid" id="ds-grid"><div class="empty">loading…</div></div>
+    </section>
+
+    <!-- ================= WORKFLOWS ================= -->
+    <section class="view" id="view-workflows">
+      <div class="view-head" data-index="05">
+        <h2>Workflows</h2>
+        <span class="sub">scheduled runs · last outcomes per workflow</span>
+        <span class="right">
+          <span id="wf-status"></span>
+          <button class="ctrl" id="wf-new" type="button">New workflow</button>
+          <button class="ctrl" id="wf-reload" type="button">reload</button>
+        </span>
+      </div>
+      <div class="panel" id="wf-list"><div class="empty">loading…</div></div>
+      <div class="panel" id="wf-editor">
+        <div class="wf-editor-head">
+          <strong id="wf-editor-title">New workflow</strong>
+          <span class="right">
+            <button class="ctrl" id="wf-editor-close" type="button">close</button>
+          </span>
+        </div>
+        <div id="wf-banners"></div>
+        <div class="row" style="gap:12px; margin-bottom:10px; flex-wrap:wrap">
+          <label class="wf-field">
+            <span>name</span>
+            <input id="wf-name" spellcheck="false" autocomplete="off" />
+          </label>
+          <label class="wf-field">
+            <span>sourceRoot</span>
+            <select id="wf-source-root">
+              <option value="overlay">overlay (agents-org)</option>
+              <option value="public">public (workflows/)</option>
+            </select>
+          </label>
+        </div>
+        <textarea id="wf-markdown" spellcheck="false"></textarea>
+        <label id="wf-anyway-row" class="row" style="display:none; margin-top:calc(8 * var(--baseline-font)); gap:calc(8 * var(--baseline-font)); align-items:center; font-size:calc(12 * var(--baseline-font))">
+          <input id="wf-anyway" type="checkbox" />
+          commit here anyway (<span id="wf-branch"></span> is not main/master)
+        </label>
+        <div class="row" style="margin-top:10px; gap:6px">
+          <button class="ctrl" id="wf-validate" type="button">Validate</button>
+          <button class="ctrl" id="wf-save" type="button">Save &amp; commit</button>
+        </div>
+        <pre id="wf-save-result"></pre>
+      </div>
+      <div class="wf-foot">Workflow mutations write dashboard_audit and a scoped git commit. They post to a Slack output channel when the definition has one. Otherwise the trail is weaker than Slack ! commands. Commits are not pushed.</div>
+    </section>
+
+    <!-- ================= PIPELINES ================= -->
+    <section class="view" id="view-pipelines">
+      <div class="view-head" data-index="06">
+        <h2>Pipeline dispatches</h2>
+        <span class="sub">start-to-finish assignment history · replies and outcomes</span>
+        <span class="right">
+          <label class="ctrl-check">
+            <input type="checkbox" id="pipeline-include-default" />
+            include default
+          </label>
+          <select class="ctrl" id="pipeline-kind" aria-label="Filter pipelines by type">
+            <option value="">all types</option>
+            <option value="product">product</option>
+            <option value="bug">bug</option>
+          </select>
+          <select class="ctrl" id="pipeline-filter" aria-label="Filter pipelines by status">
+            <option value="">all statuses</option>
+            <option value="active">active</option>
+            <option value="waiting">waiting</option>
+            <option value="needs-human">needs human</option>
+            <option value="terminal">terminal</option>
+          </select>
+          <button class="ctrl" id="pipeline-refresh" type="button">refresh</button>
+        </span>
+      </div>
+      <div class="pipeline-layout">
+        <div class="pipeline-stage" id="pipeline-stage">
+          <div class="pipeline-mode" role="tablist" aria-label="Pipeline visualization">
+            <button class="ctrl on" id="pipeline-mode-trace" type="button" role="tab" aria-selected="true">dispatch trace</button>
+            <button class="ctrl" id="pipeline-mode-topology" type="button" role="tab" aria-selected="false">directed flow</button>
+          </div>
+          <div class="pipeline-trace" id="pipeline-trace" aria-label="Pipeline dispatch trace"></div>
+          <div class="pipeline-topology" id="pipeline-topology" hidden>
+            <div class="pipeline-flow-viewport" id="pipeline-flow-viewport" aria-label="Interactive directed pipeline flow">
+              <div class="pipeline-flow-world" id="pipeline-flow-world">
+                <svg class="pipeline-flow-links" id="pipeline-flow-links" aria-hidden="true"></svg>
+                <div class="pipeline-flow-nodes" id="pipeline-flow-nodes"></div>
+              </div>
+            </div>
+            <div class="pipeline-topology-context">
+              <span>directed flow</span>
+              <strong id="pipeline-topology-title">selected run</strong>
+              <small id="pipeline-topology-meta">dispatches move left to right · replies return on dashed lines</small>
+            </div>
+            <div class="pipeline-tools">
+              <button class="ctrl" id="pipeline-reset" type="button">reset</button>
+              <button class="ctrl" id="pipeline-fit" type="button">frame</button>
+              <button class="ctrl on" id="pipeline-replies" type="button">replies</button>
+            </div>
+            <div class="pipeline-hud">
+              <span class="legend"><span class="sw" style="background:#4f8cff"></span>leased / pending</span>
+              <span class="legend"><span class="sw" style="background:#f59e0b"></span>waiting</span>
+              <span class="legend"><span class="sw" style="background:#22c55e"></span>completed</span>
+              <span class="legend"><span class="sw" style="background:#ff3b3b"></span>failed</span>
+              <span class="legend"><span class="sw" style="background:#666666"></span>cancelled</span>
+              <span class="legend" id="pipeline-graph-stats">— assignments · — branches</span>
+              <span class="hint">drag pan · wheel zoom · click an assignment</span>
+            </div>
+          </div>
+          <div class="pipeline-status" id="pipeline-status">loading pipeline control plane…</div>
+        </div>
+        <div class="pipeline-rail" role="complementary" aria-label="Pipeline runs">
+          <div class="pipeline-summary" id="pipeline-summary"></div>
+          <div class="pipeline-detail" id="pipeline-detail" style="display:none"></div>
+          <div class="pipeline-rail-head"><span>all runs</span><span id="pipeline-count">—</span></div>
+          <div class="panel pipeline-runs" id="pipeline-runs"><div class="empty">loading…</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= RUNBOOKS ================= -->
+    <section class="view" id="view-runbooks">
+      <div class="view-head" data-index="07">
+        <h2>Runbooks</h2>
+        <span class="sub">reviewed playbooks · view only · not workflows</span>
+        <span class="right"><input class="search" id="rb-search" placeholder="filter name / owner / tag…" autocomplete="off" /></span>
+      </div>
+      <div class="chips" id="rb-risks" style="margin-bottom: calc(14 * var(--baseline-font))"></div>
+      <div class="profiles-layout">
+        <div class="panel profile-list" id="rb-list"><div class="empty">loading…</div></div>
+        <div class="panel profile-detail" id="rb-detail"><div class="empty">select a runbook</div></div>
+      </div>
+    </section>
+
+    <!-- ================= SPEND ================= -->
+    <section class="view" id="view-spend">
+      <div class="view-head" data-index="08">
+        <h2>Spend</h2>
+        <span class="sub" id="spend-sub">token ledger · host timezone</span>
+      </div>
+      <div class="stat-grid" id="spend-kpis"><div class="empty">loading…</div></div>
+      <h3 class="sect">Group by</h3>
+      <div class="chips" id="spend-groups" style="margin-bottom: calc(14 * var(--baseline-font))"></div>
+      <div class="panel data-table-wrap" id="spend-table"><div class="empty">loading…</div></div>
+    </section>
+
+    <!-- ================= PROFILES ================= -->
+    <section class="view" id="view-profiles">
+      <div class="view-head" data-index="09">
+        <h2>Profiles</h2>
+        <span class="sub">grounded working context · inspection does not affect recall freshness</span>
+        <span class="right"><input class="search" id="profile-search" placeholder="filter profiles…" autocomplete="off" /></span>
+      </div>
+      <div class="profile-stats" id="profile-stats"></div>
+      <div class="chips" id="profile-kinds" style="margin-bottom: calc(14 * var(--baseline-font))"></div>
+      <div class="profiles-layout">
+        <div class="panel profile-list" id="profile-list"><div class="empty">loading profiles…</div></div>
+        <div class="panel profile-detail" id="profile-detail"><div class="empty">select a profile</div></div>
+      </div>
+    </section>
+
+    <!-- ================= MEMORY ================= -->
+    <section class="view" id="view-memory">
+      <div class="view-head" data-index="10">
+        <h2>Memory</h2>
+        <span class="sub">3D projection — local neighbourhoods are meaningful, global distances are not</span>
+        <span class="right">
+          <input class="search" id="mem-q" type="text" placeholder="filter text · ⏎ semantic recall" autocomplete="off" />
+          <button class="ctrl" id="mem-clear" type="button">clear</button>
+          <button class="ctrl" id="cloud-refresh" type="button">rebuild</button>
+        </span>
+      </div>
+
+      <div class="mem-filters">
+        <div class="mem-filter-row">
+          <span class="lbl">kind</span>
+          <div class="chips" id="mem-kinds"></div>
+          <span class="lbl" style="width:auto;margin-left:10px">repo</span>
+          <div class="chips" id="mem-repos"></div>
+        </div>
+        <div class="mem-filter-row">
+          <span class="lbl">tags</span>
+          <input class="search" id="mem-tag-q" type="text" placeholder="find a tag…" style="width:150px" autocomplete="off" />
+          <div class="chips" id="mem-tags"></div>
+        </div>
+      </div>
+
+      <div class="mem-layout">
+        <div class="galaxy-wrap" id="galaxy-wrap">
+          <canvas id="memory-canvas"></canvas>
+          <div class="galaxy-tools">
+            <button class="ctrl on" id="gal-links" type="button" title="show KNN links">links</button>
+            <button class="ctrl on" id="gal-spin" type="button" title="idle auto-rotate">spin</button>
+            <button class="ctrl" id="gal-frame" type="button" title="frame the current filter">frame</button>
+            <button class="ctrl" id="gal-reset" type="button" title="reset the camera">reset</button>
+          </div>
+          <div class="galaxy-hud">
+            <span class="lg"><span class="sw" style="background:#34d399"></span>lesson</span>
+            <span class="lg"><span class="sw" style="background:#3b82f6"></span>fact</span>
+            <span class="lg"><span class="sw" style="background:#a76eff"></span>situation-claim</span>
+            <span id="gal-stats"></span>
+            <span class="hint">drag orbit · wheel zoom · shift-drag pan<br />click a star to focus</span>
+          </div>
+          <div class="tip" id="cloud-tip" style="max-width:340px;white-space:normal"></div>
+          <div class="galaxy-status" id="cloud-status">loading…</div>
+        </div>
+        <div class="mem-rail">
+          <div id="mem-detail"></div>
+          <div class="mem-rail-head"><span id="mem-rail-title">claims</span><span class="n" id="mem-rail-count"></span></div>
+          <div class="panel mem-scroll" id="claim-list"><div class="empty">loading the galaxy…</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= DOCS ================= -->
+    <section class="view" id="view-docs">
+      <div class="view-head" data-index="11">
+        <h2>Docs</h2>
+        <span class="sub">read-only browser over docs/**/*.md</span>
+      </div>
+      <div class="docs-layout">
+        <div class="panel doc-tree" id="doc-tree"><div class="empty">loading…</div></div>
+        <div class="panel doc-pane" id="doc-pane"><div class="empty">select a file</div></div>
+      </div>
+    </section>
+
+    <!-- ================= AUDIT ================= -->
+    <section class="view" id="view-audit">
+      <div class="view-head" data-index="12">
+        <h2>Audit</h2>
+        <span class="sub">dashboard mutations · newest first · loopback only</span>
+      </div>
+      <div class="log-toolbar">
+        <input class="search" id="audit-action" placeholder="action…" autocomplete="off" />
+        <select class="ctrl" id="audit-target" aria-label="Filter audit by target type">
+          <option value="">all targets</option>
+          <option value="session">session</option>
+          <option value="workflow">workflow</option>
+          <option value="pipeline">pipeline</option>
+          <option value="runbook">runbook</option>
+        </select>
+        <input type="date" class="ctrl" id="audit-from" aria-label="Audit from date" />
+        <input type="date" class="ctrl" id="audit-to" aria-label="Audit to date" />
+        <button class="ctrl" id="audit-clear" type="button">clear filters</button>
+      </div>
+      <div class="panel data-table-wrap" id="audit-table"><div class="empty">loading…</div></div>
+    </section>
+
+  </div>
+
+  <!-- thread detail drawer -->
+  <div class="drawer-scrim" id="drawer-scrim"></div>
+  <div class="drawer" id="drawer"></div>
+
+<script type="module">
+import * as THREE from "/assets/three.module.js";
+window.THREE = THREE;
+const loadScript = (src) => new Promise((resolve, reject) => {
+  const el = document.createElement("script");
+  el.src = src;
+  el.onload = resolve;
+  el.onerror = () => reject(new Error("failed to load " + src));
+  document.body.appendChild(el);
+});
+for (const src of [
+  "/js/api.js",
+  "/js/markdown.js",
+  "/js/threads.js",
+  "/js/workflows.js",
+  "/js/pipeline-directed-flow-layout.js",
+  "/js/pipelines.js",
+  "/js/pipeline-directed-flow.js",
+  "/js/galaxy.js",
+  "/js/spend.js",
+  "/js/runbooks.js",
+  "/js/audit.js",
+  "/js/app.js",
+]) {
+  await loadScript(src);
+}
+</script>
+</body>
+</html>

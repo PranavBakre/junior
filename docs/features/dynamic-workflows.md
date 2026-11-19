@@ -1,0 +1,381 @@
+# Dynamic Workflows
+
+> **Current status (2026-08-15):** Shipped. The registry, SQLite state/run store, hot reload, scheduler, Slack commands, and localhost dashboard (read + enqueue/start/stop/reload + Git-backed create/edit) are live. The public and private workflow roots can each supply definitions. Native handlers run deterministic code directly.
+
+## Problem
+
+Junior needs recurring and on-demand workflows that can be added without restarting the bot. The first workflow is a daily worklog: collect my PRs and commits, turn them into grouped "things I did", store a markdown artifact, and post a Slack summary.
+
+**Who has this problem:** Junior operators who need repeatable automation.
+**What happens today:** Workflow definitions are discovered from `workflows/` and `agents-org/workflows/`, reloaded on file changes, persisted in SQLite, and controllable through `!workflow` / `!workflows` and the localhost dashboard. Slack `!workflow run` still awaits blocking `runNow`. The dashboard calls `enqueueManualRun` (durable `persistNewRun`, then background `executePersistedRun`) so a long worklog does not hold the HTTP request. Create/edit write `*.workflow.md` and commit on a named branch (detached HEAD refused); overlay writes also try a Junior submodule-pointer commit.
+**Painful part:** Every new cron-like behavior currently risks becoming a code deploy.
+**"Finally" moment:** Add or edit `agents-org/workflows/worklog.workflow.md`; Junior reloads it, schedules it, and owners can `!workflow run worklog` or `!workflow stop worklog` from Slack.
+
+## Source Layout
+
+Workflow files are markdown files with YAML frontmatter and a prompt body.
+
+Junior loads only these fixed roots:
+
+- `workflows/*.workflow.md` — public repo workflows
+- `agents-org/workflows/*.workflow.md` — private/org overlay workflows
+
+There is no `WORKFLOW_DIRS` environment variable. `docs/` is for Junior documentation, not executable workflow definitions.
+
+Overlay precedence:
+
+1. `agents-org/workflows/<name>.workflow.md` overrides `workflows/<name>.workflow.md`.
+2. If an edited overlay becomes invalid, Junior keeps the last-known-good overlay in memory and reports the validation error.
+3. Junior does not silently fall back to the public workflow while an overlay with the same name is invalid.
+4. If a valid workflow file is deleted, the workflow is removed on the next reload.
+
+Submodule contract:
+
+- `.gitmodules` is the authoritative source for mounted submodules.
+- The private agent/identity submodule may provide `agents-org/workflows/`.
+- Identity documents in the private submodule follow the existing `identity/<persona>/IDENTITY.md` and `identity/<persona>/SOUL.md` structure. Workflow docs reference that structure only as a contract; they do not duplicate persona details.
+
+## Workflow Schema
+
+```yaml
+---
+name: worklog
+enabled: true
+description: Daily PR and commit worklog
+ownerSlackUserIds:
+  - U123ABC
+triggers:
+  - type: schedule
+    cron: "0 18 * * 1-5"
+    timezone: Asia/Kolkata
+  - type: command
+    command: worklog
+outputs:
+  - type: docs
+    path: data/workflow-runs/worklog
+  - type: slack
+    channel: C123ABC
+permissions:
+  repos:
+    - junior
+  tools:
+    - git
+    - gh
+    - docs.write
+    - slack.post
+runner:
+  provider: default
+  agentName: lead
+  timeoutMs: 1200000
+  idleTimeoutMs: 300000
+  maxIdleInterrupts: 3
+concurrency: skip
+---
+
+Collect PRs and commits from the last 24 hours. Group them by meaningful work item.
+Keep the Slack output compact.
+```
+
+Fields:
+
+| Field | Required | Notes |
+|---|---:|---|
+| `name` | yes | Lowercase kebab-case. Must match `<name>.workflow.md`. |
+| `enabled` | yes | File-level kill switch. `false` prevents start/run/schedule even if DB status says active. |
+| `description` | no | Human-readable summary. |
+| `ownerSlackUserIds` | yes | Slack users allowed to run/start/stop this workflow. May be empty for admin-only workflows. Admins are always allowed. |
+| `triggers` | yes | At least one schedule, command, or Slack event trigger. |
+| `outputs` | yes | At least one output. Docs output must stay under `data/workflow-runs/<workflow>`. |
+| `permissions` | yes | Capability declaration used by workflow validation and runtime prompts. `repos` may be omitted to use all configured repos, or listed to narrow access. |
+| `runner` | no | Optional agent execution step. Runner workflows execute from `/tmp/junior-utility`; workflow definitions are trusted config, not a sandbox boundary. `idleTimeoutMs` and `maxIdleInterrupts` opt into the CLI SIGINT/resume fallback for silent runner processes. |
+| `fallback` | no | Optional deterministic fallback declaration (`mode: deterministic-summary`) accepted by the schema; no current workflow uses it as a runner fallback. |
+| `concurrency` | no | `skip` by default. `parallel` is allowed for workflows that can overlap safely. |
+
+Trigger schema:
+
+```yaml
+triggers:
+  - type: schedule
+    cron: "0 18 * * 1-5"
+    timezone: Asia/Kolkata
+  - type: command
+    command: worklog
+  - type: slack-event
+    channel: C123ABC
+    pattern: "\\bworklog\\b"
+```
+
+Command triggers must not collide with built-in Junior commands. Unknown `!<command>` messages are left intact by the Slack parser, so the workflow controller can match dynamic command triggers before normal agent dispatch.
+
+**Operator instructions.** Text after the command word is passed to the run as free-text scoping — `!worktree-prune only merged branches from widgets`, or `!workflow run worktree-prune only merged branches from widgets`. It is normalized, bounded to 500 characters, injected after the workflow prompt with explicit framing that it may narrow the run but never relax a safety rule, verification step, or approval gate, and recorded in the run artifact (`Operator instructions:`). Scheduled runs never carry any. Native-handler workflows reject operator instructions because their deterministic handlers cannot apply free-text scope. This exists so a one-off variation on an agent-run maintenance workflow re-runs the workflow rather than becoming a repo-bound agent dispatch, which would provision a worktree in the repo being maintained.
+
+Output schema:
+
+```yaml
+outputs:
+  - type: docs
+    path: data/workflow-runs/worklog
+  - type: slack
+    channel: C123ABC
+    threadTs: "1710000000.000000"
+  - type: slack-thread
+    channel: C123ABC
+```
+
+Permission tools:
+
+- `git` — read local Git history
+- `gh` — read GitHub PR metadata with the GitHub CLI
+- `docs.write` — write run artifacts under `data/workflow-runs/`
+- `slack.post` — post Slack summaries
+- `memory.read` — recall v3 memory (claims/profiles) through the memory CLI/tool surface
+- `memory.write` — add claims / run the v3 consolidation sweep through memory code
+- `memory.evaluate` — inspect consolidation sweep reports (episodes/profiles/claims)
+
+`permissions.tools` is not a general runner sandbox. It is validated and injected into the runner prompt as the declared capability contract. Workflow definition files are trusted operational config; private overlays should be reviewed like code.
+
+Repository scope:
+
+- Omit `permissions.repos` to run against every repo in `REPOS`.
+- Set `permissions.repos` to a list of repo names to narrow access.
+- Listed repo names are validated against configured `REPOS` at load time.
+
+## Runtime State
+
+Runtime artifacts:
+
+- `data/workflow-runs/<workflow>/<date>-<runId>.md`
+
+SQLite tables:
+
+- `workflow_states`
+- `workflow_runs`
+
+Workflow state:
+
+| Status | Meaning |
+|---|---|
+| `active` | Schedule, command, and event triggers may run when the file is enabled. |
+| `stopped` | Runtime stop set by `!workflow stop <name>`. Manual `run` still requires owner/admin and file enabled. |
+| `invalid` | Reserved for invalid loaded state. Invalid file edits currently stay in registry errors while last-known-good remains active. |
+
+Effective state is computed as:
+
+```text
+file enabled === true AND workflow_states.status === active
+```
+
+If the file says `enabled: false`, it wins. `!workflow start <name>` refuses to start it until the file is changed back to `enabled: true`.
+
+The dashboard's prominent workflow status is a live projection: an active run
+tracked by the current scheduler process takes precedence over the persisted
+scheduler status. Historical `workflow_runs.status = 'running'` rows are not
+used as proof of live work because a hard process exit can leave one behind.
+The scheduler counts active runs per workflow so this remains correct for both
+`skip` and `parallel` concurrency.
+
+System/event callers may attach structured `triggerContext` to a run. The
+executor includes it in the runner's `run` runtime context and the durable run
+artifact. GitHub reconciliation uses this to launch `worktree-prune` for the
+exact repo, branch, and head SHA of newly merged PRs without turning cleanup
+into a repo-bound agent dispatch. Event-triggered GitHub runs filter runtime
+repositories by canonical `RepoConfig.githubRepo`, not local repository names.
+
+## Slack Commands
+
+Read commands:
+
+- `!workflows`
+- `!workflow show <name>`
+- `!workflow logs <name>`
+
+Owner/admin commands:
+
+- `!workflow run <name> [instructions]`
+- `!workflow stop <name>`
+- `!workflow start <name>`
+- Custom workflow commands, for example `!worklog`
+- Human-triggered `slack-event` workflows
+
+Admin-only commands:
+
+- `!workflow reload`
+
+Authorization uses existing Junior admins plus `ownerSlackUserIds` from the workflow file. Non-authorized mutating commands are rejected with a reaction and no workflow run.
+
+The dashboard uses the same `canManage` / admin checks with actor `ADMIN_SLACK_USER_ID` or `dashboard-operator`. Create/edit/reload require admin (open-mode still allows them, matching Slack). Dashboard run/start/stop/reload/create/edit write `dashboard_audit`. If the definition has a `slack` or `slack-thread` output, the dashboard also posts a one-liner there. **If it has none, git + `dashboard_audit` is a weaker trail than Slack `!` commands** — accepted for the no-auth loopback console, not Slack-parity. Continue/stop on sessions remain full Slack-thread records; see [http-dashboard.md](http-dashboard.md).
+
+## Git provenance
+
+Workflow files are executable operational configuration, so loading from the
+working tree is not sufficient proof that a definition was published. On every
+scan the registry verifies public files and private overlay files against their
+repository's configured default ref (`origin/main` by default). The working
+tree bytes must match the blob at that ref and the ref must contain the file.
+Untracked files, feature-branch-only definitions, dirty edits, missing default
+refs, and definitions absent from the default tree remain unpublished: they are
+reported in registry errors and are neither active nor schedulable. An
+unpublished edit also evicts any previously loaded version, so a last-known-good
+cache cannot preserve unverified authority.
+
+Verified definitions retain the default-ref commit SHA. New `workflow_runs`
+rows persist that SHA in `verified_commit_sha`, and the run artifact includes it
+alongside the content hash and source path. This makes each run traceable to the
+published definition snapshot used to authorize it. Dashboard authoring may
+commit a definition on a named branch, but it becomes runnable only after that
+commit is merged into the configured default branch and the watcher reloads.
+
+## Hot Reload
+
+Junior uses `fs.watch` on both fixed workflow roots. Watch events are debounced and followed by a full rescan of each root because file watchers can coalesce, duplicate, or miss exact filenames across platforms.
+
+Manual reload still exists:
+
+- `!workflow reload` forces a rescan.
+- It is a diagnostic/repair command, not the normal way to deploy workflows.
+- It is useful when a root was missing at boot, a watcher errored, or an operator wants immediate feedback after repairing a validation error.
+
+Start/stop commands do not reload files. They only mutate runtime state:
+
+- `!workflow stop <name>` writes `stopped` and cancels scheduled timers.
+- `!workflow start <name>` writes `active` and reschedules, but only if the file is enabled.
+
+## Worklog Workflow
+
+`agents-org/workflows/worklog.workflow.md` is an agent-run workflow. The scheduler triggers
+the markdown definition, the executor spawns the configured runner from
+`/tmp/junior-utility`, and the runner uses the supplied repo paths plus the
+workflow prompt to collect Git/GitHub activity and return a Slack-ready summary.
+Junior then writes that final response under `data/workflow-runs/worklog/` and
+posts it to configured Slack outputs.
+
+## Memory Consolidation Workflow
+
+The v3 memory consolidation ("dreaming") engine uses this workflow system rather than a bespoke scheduler. The `memory-consolidation` workflow runs the shared `runConsolidationSweep` helper (the same path the `consolidate-v3` CLI and the `memory_consolidate` MCP tool use); it can run on a cron schedule and by owner/admin command, skip overlapping runs with `concurrency: skip`, write artifacts under `data/workflow-runs/memory-consolidation`, and optionally post a compact Slack summary. See [memory-system-v3.md](memory-system-v3.md) §7.
+
+### Memory decay report
+
+`memory-decay-report` is a report-first native workflow. Its scheduled and
+command triggers call `archiveStaleClaims` with `apply: false`, using the owned
+`MEMORY_ARCHIVE_OLDER_THAN_MS` and `MEMORY_ARCHIVE_MAX_WEIGHT` thresholds. The
+artifact lists candidate claim IDs; no rows are changed. After review, an
+operator must run `bun run src/memory/cli.ts archive-stale --apply` with the
+same thresholds to archive candidates. Archival sets `active = 0` and never
+deletes claims or their provenance. There is no hot-path TTL.
+
+The sweep itself is the LLM pass — it spawns the runner (`claude -p`) per session to derive episodes/profiles/claims; the workflow definition does not place that logic in prompt prose. Workflow utility runs skip Junior's project MCP wiring because they run from `/tmp/junior-utility`, so a manual sweep can also go through the CLI surface:
+
+```bash
+bun run <runtime context junior.memoryCli> consolidate-v3 --json
+bun run <runtime context junior.memoryCli> recall-claims --query "dashboard routing" --json
+```
+
+The CLI uses `MEMORY_DB_PATH` when set, otherwise `data/memory.db`. Because workflow runners execute from `/tmp/junior-utility`, the runtime context includes `junior.projectRoot` and `junior.memoryCli` absolute paths. Normal Junior runner sessions with MCP wiring can use `memory_recall`, `memory_add`, and `memory_consolidate` instead.
+
+## Memory Dedup Sweep Workflow
+
+`memory-dedup-sweep` is the second native (no-runner) workflow. It runs
+`runDedupSweep` in-process to cluster claim near-duplicates that predate the
+store's write guard and reports the plan. Like `migrate-v3.ts` it is **dry-run by
+default**: the scheduled run never mutates memory, because a merged-away claim is
+recoverable only from provenance. Committing is an explicit operator action —
+`bun run src/memory/cli.ts dedup-sweep --apply`, with the bot stopped so it does
+not contend for the WAL writer. See
+[claim-dedup-write-guard.md](claim-dedup-write-guard.md).
+
+## Slack Archive Maintenance Workflow
+
+`slack-archive-maintenance` is a weekly native workflow
+(`workflows/slack-archive-maintenance.workflow.md`). It calls
+`runSlackArchiveMaintenance()` in-process to synchronize approved Slack
+history, embed changed messages, and atomically republish the ANN index. It is
+scheduled for Sunday 03:17 Asia/Kolkata and can also be run with
+`!slack-archive-maintenance`; it has no runner prompt and writes only its
+workflow artifact.
+
+## Private native reports
+
+The report module runs with Junior's service permissions. Build it from reviewed
+Junior and overlay revisions in a clean checkout, then install the bundle
+outside the application and workflow-authoring checkouts. Give the service
+read access and reserve write access for the administrator who installs it.
+
+```sh
+bun build agents-org/native-workflows/index.ts --target bun --outfile /secure/staging/private-reports.mjs
+```
+
+Set `JUNIOR_PRIVATE_REPORTS_MODULE` to the installed bundle's absolute path
+before starting Junior. Workflow definitions in the private overlay can select
+a supported report by name. Their names, schedules, Slack destinations, and
+artifact locations come from the overlay definitions. Junior's workflow
+provenance checks apply to those definitions. The administrator controls
+the executable bundle separately.
+
+Before restarting Junior, fetch the overlay default branch in the service
+checkout. Use the pinned overlay revision from the Junior checkout.
+
+```sh
+git submodule update --init agents-org
+git -C agents-org fetch origin refs/heads/main:refs/remotes/origin/main
+```
+
+From the Junior checkout, run the following with the same user and environment
+as the service. A passing check confirms that both report exports are callable
+and all four migrated workflows resolve from the published overlay. The check
+does not run a report or send Slack messages.
+
+```sh
+bun -e '
+import { isAbsolute } from "node:path";
+import { loadConfig } from "./src/config.ts";
+import { WorkflowRegistry } from "./src/workflows/registry.ts";
+
+const modulePath = process.env.JUNIOR_PRIVATE_REPORTS_MODULE;
+if (!modulePath || !isAbsolute(modulePath)) {
+  throw new Error("Set JUNIOR_PRIVATE_REPORTS_MODULE to the installed bundle");
+}
+const { reports } = await import(modulePath);
+for (const name of ["infra-report", "web-activity-report"]) {
+  if (typeof reports?.[name] !== "function") throw new Error(`Missing report ${name}`);
+}
+const registry = new WorkflowRegistry({ repos: loadConfig().repos });
+const { definitions, errors } = await registry.reload();
+if (errors.length) throw new Error(JSON.stringify(errors));
+for (const name of ["growthx-infra-report", "web-activity-report", "worklog", "worktree-prune"]) {
+  const definition = definitions.get(name);
+  if (definition?.sourceRoot !== "overlay" || !definition.verifiedCommitSha) {
+    throw new Error(`Workflow ${name} did not load from the published overlay`);
+  }
+}
+console.log("Private reports and published overlay workflows are ready");
+'
+```
+
+### Runner idle interrupt fallback
+
+Workflow runner configs can set `idleTimeoutMs` to recover from a silent CLI run before the hard `timeoutMs` expires. The executor starts an idle timer for each CLI attempt and resets it on every normalized runner event. When the timer fires, Junior sends `SIGINT` to the provider process, waits up to 10 seconds for it to exit, then sends `SIGKILL` as a cleanup fallback. If the run has already emitted a provider session id, Junior immediately spawns a new `opencode run --session <id>` / `claude --resume <id>` attempt with a compact "continue from the last completed step" prompt. `maxIdleInterrupts` bounds the number of resume attempts; after that, the run fails normally.
+
+This is a CLI fallback, not OpenCode's native server interrupt. The implemented OpenCode SDK/server provider uses provider-native abort semantics; the fallback applies to silent CLI workflow attempts.
+
+## Dependencies
+
+- Slack Event Handler — must leave unknown `!<command>` text intact.
+- Thread Commands — reserves built-in command names and provides admin identity.
+- Runner Providers — optional summarization/compression.
+- Session SQLite DB — stores workflow state and run history.
+- `cron-parser` — computes next scheduled runs with timezone support.
+- `yaml` — parses workflow frontmatter.
+
+## Cut List
+
+- Interactive workflow creation from Slack (the dashboard can already create/edit Git-backed files).
+- Multi-step workflow DAGs.
+- Retrying failed workflow runs from the UI.
+- Per-output templates.
+- Workflow-specific secrets.
+- Automatic `git push` / PR after a dashboard create or edit. Commits stay local and unpushed. Detached HEAD, merge, and rebase are refused; overlay writes also commit the Junior `agents-org` pointer (`git add -- agents-org` only) and report — without rolling back the overlay — if that parent commit fails.
+- Slack-parity conversation-of-record for dashboard workflow writes that have no Slack output channel. Today those leave only git + `dashboard_audit`.
+
+The localhost dashboard lists definitions, state, recent runs, and registry
+errors, and can enqueue (`enqueueManualRun`), start, stop, reload, create, and
+edit workflows. See [http-dashboard.md](http-dashboard.md).

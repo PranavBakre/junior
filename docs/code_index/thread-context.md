@@ -1,0 +1,83 @@
+# Code Index: Thread Context
+
+Builds the prompt preamble that gives spawned Claude processes identity, channel awareness, workspace safety rules, and conversation history.
+
+## Code Index
+
+### src/slack/thread-context.ts
+
+| Symbol | Purpose |
+|---|---|
+| `buildPromptPreamble(app, channel, threadTs, latestTs, botUserId?, workspace?, worktreePaths?, repos?, contextProfile?, identityRepoName?, identityAuthenticated?, ambiguousRepos?)` | Composes the full preamble. Each block (`identity`, `slack-context`, `thread-context`) emitted only if its flag in `contextProfile` is true; the workspace *rules* follow `contextProfile.workspace`, but the `<github-identity>` block does not — credentials reach the runner whatever the profile says. Defaults to all-true via `DEFAULT_CONTEXT_PROFILE`. |
+| `buildWorkspaceBlock(workspace, worktreePaths?, repos?, threadId?)` | Standalone workspace-**rules** block only. Used in the full preamble AND on resumed turns (cheap safety reminder). Multi-repo format when `worktreePaths` non-empty; single-repo when a workspace exists; `null` otherwise. Emitted under `contextProfile.workspace`. |
+| `buildIdentityBlock({ repos?, identityRepoName?, identityAuthenticated?, ambiguousRepos?, hasCheckout? })` | The identity statement, separate from the rules because the two have different gates. Renders a `<github-identity>` block naming the repo this turn authenticates against, or — when none resolved — why (credentials missing, an ambiguous directive, or a bound repo that left `REPOS`). Its remote-work invitation is suppressed when a checkout is present (`hasCheckout`) and when there are no credentials. `null` when there is nothing to state. |
+| `<github-identity>` block | Names the repo a turn authenticates against, so a turn holding `GH_TOKEN` without a checkout knows what to use it against. Emitted whether or not an identity resolved, and whatever the agent's `context.workspace` profile says — a token reaches the runner either way. A resolved identity whose credentials did *not* arrive is still named (`identityAuthenticated: false`), with the reason, instead of being silently withheld; its "work against the repository remotely" line is gated on `identityAuthenticated`, so the withheld-token cases (including a failed worktree for the identity's own repo) emit the statement without the invitation. A turn naming two or more configured repositories (`identityAmbiguousRepos`) resolves no identity and renders the block *without* a `Repository:` line, saying which repos it named. |
+| `resolveSlackMentions(app, text)` | Rewrites `<@U…>` → `@DisplayName (<@U…>)` so agents can address users by name. Pre-resolves unique IDs in parallel, then single-pass regex replace. |
+| `WorkspaceContext` | Type: `{ worktreePath, repoName, repoPath, branchName }` |
+
+### Caches (module-private)
+
+| Cache | Keyed | Filled by |
+|---|---|---|
+| `channelNameCache` | channel ID → name | `resolveChannelName` (`conversations.info`) |
+| `userNameCache` | user ID → display name | `resolveUserName` (`users.info`); picks `profile.display_name → real_name → name → id`) |
+
+Both caches live for the process lifetime — no TTL. Tradeoff: renames/relabels need a restart to refresh.
+
+## Preamble Structure
+
+```xml
+<identity>
+{persona from IDENTITY.md + SOUL.md}
+Your Slack user ID is {botUserId}. Messages from this user ID in the thread are yours.
+</identity>
+
+<slack-context>
+Channel: #{name} ({channelId})
+Thread: {ts}
+... (NO_SLACK_MESSAGE sentinel rules, no-double-post rule)
+</slack-context>
+
+<workspace>
+(single-repo: Target repo / Worktree / branch / RULES)
+(multi-repo:  per-repo blocks of worktree + bare-repo + branch + base)
+</workspace>
+
+<github-identity>
+(sibling of <workspace>, never nested in it: named repo + what Junior
+resolved for this turn, no write rules)
+</github-identity>
+
+<thread-context>
+Junior (you): previous response
+User(Name <@U123>): their message [shared image: screenshot.png]
+</thread-context>
+```
+
+## Key Concepts
+
+### Context-profile gating
+
+`buildPromptPreamble` only fetches data for enabled blocks — skipping `threadHistory` means no `conversations.replies` round-trip. Saves tokens AND latency for lightweight task agents.
+
+### Workspace block on resumed turns
+
+`runClaudeWithAgent` injects the full preamble on first turn (when there's no `sessionId` yet) and only the workspace block on resumed turns. The workspace safety rule ("don't edit the bare repo") is cheap insurance that's worth re-asserting every turn.
+
+The workspace block also states that Junior refreshed remote refs before the
+turn. Sandboxed workers inspect the configured `origin/*` base and do not run
+`git fetch`, because linked worktrees keep fetch metadata in the off-limits
+shared checkout.
+
+### Multi-repo workspace format
+
+Bug-pipeline threads have `worktreePaths: Record<repoName, path>`. The multi-repo block lists each repo's worktree, bare repo (off-limits), branch (`slack/<threadId>`), and base ref, plus a numbered RULES list that forbids editing outside the worktrees and running dev servers directly (`!devserver` is the supported path).
+
+### Thread history
+
+Excludes the current message (`latestTs`), max 100 replies. Bot messages labeled `"Junior (you)"`; users labeled `User(DisplayName <@USERID>)`. File names appended as `[shared image: foo.png]`. Mentions in body text resolved via `resolveSlackMentions`.
+
+## Dependencies
+
+- **Uses**: `@slack/bolt` (`conversations.replies`, `conversations.info`, `users.info`), `persona.loadPersona`, `agents/loader` (`AgentContextProfile`, `DEFAULT_CONTEXT_PROFILE`), `slack/formatting` (`NO_SLACK_MESSAGE`)
+- **Used by**: `SessionManager.runClaudeWithAgent` (first-turn preamble + per-turn workspace block + mention resolution on prompts)

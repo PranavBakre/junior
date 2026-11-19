@@ -1,0 +1,99 @@
+# Code Index: Slack Event Handler
+
+Slack Bolt app setup, event filtering (with self-bot directive escape hatch), home tab, and file extraction. Posting/formatting live in `stream-to-slack.md` and `thread-context.md`.
+
+## Code Index
+
+### src/slack
+
+| Symbol | File | Purpose |
+|---|---|---|
+| `createSlackApp(config)` | `app.ts` | Bolt app with Socket Mode + `ignoreSelf: false` (lead's self-bot directives must be observed) |
+| `registerEventHandlers(app, onMessage, store?, selfBotId?, selfUserId?, autoTriggerChannels?, onArchiveMessage?, archiveApprovedChannels?)` | `events.ts` | Wires `message` + `app_mention` handlers with filtering, optional passive Slack-archive capture, and bounded server-side resolution of referenced Slack permalinks |
+| `isForeignBotThinking(text)` | `events.ts` | Detects sibling Claude bots' streaming "✽ Thinking..." messages — drop those |
+| `extractFiles(event)` (private) | `events.ts` | Pulls `{ url_private_download, name, mimetype }` from `event.files` |
+| `registerHomeTab(app, store, windowMs)` | `home.ts` | `app_home_opened` listener |
+| `publishHomeTab(app, userId, store, windowMs)` | `home.ts` | Builds and publishes the home view |
+| `buildSessionDetailModal(session)` | `home.ts` | Builds the Slack modal for one session's full details |
+
+### Types
+
+| Type | File | Shape |
+|---|---|---|
+| `SlackMessageEvent` | `events.ts` | `{ threadId, channel, user, text, ts, command, files?, isSelfBot?, botId?, botUsername?, mentionsJunior?, dedupeKey?, pipelineInvocation?, attributionUserId?, conversationalText? }`; durable default runs bound the `files` refs before persistence and restore them on pump dispatch. |
+| `boundSlackFileAttachments` / `parseSlackFileAttachments` | `files.ts` | Caps serialized Slack file refs and validates JSON-restored refs before they re-enter a synthetic event. |
+| `SlackFileAttachment` | `events.ts` | `{ url, name, mimetype }` |
+| `parseSlackPermalinks` / `resolveReferencedSlackContext` | `permalink-context.ts` | Parses up to three canonical archive links, fetches referenced message/thread context with bounded reads, and omits context on permission or fetch failure. |
+| `OnMessageCallback` | `events.ts` | `(event: SlackMessageEvent) => void` |
+
+## Event Flow
+
+```
+Slack WebSocket (Socket Mode)
+  │
+  ├── message
+  │     ├── self-bot check:
+  │     │     ├── autoTriggerChannels → let through
+  │     │     ├── contains "!<persistent-agent>" line → let through (directive escape hatch)
+  │     │     └── else → drop (loop guard)
+  │     ├── no text / foreign-bot thinking → drop
+  │     ├── derive user (event.user → selfUserId if self-bot → bot_id if auto-trigger)
+  │     ├── must be thread reply, DM, or auto-trigger channel
+  │     ├── thread + non-auto-trigger + no session in store → drop
+  │     ├── stripOwnMention (uses selfUserId)
+  │     ├── parseCommand + extractFiles
+  │     ├── resolve bounded referenced permalink context (read-only)
+  │     └── onMessage(SlackMessageEvent)
+  │
+  └── app_mention
+        ├── no user / foreign-bot thinking → drop
+        ├── stripOwnMention + parseCommand + extractFiles
+        ├── resolve bounded referenced permalink context (read-only)
+        └── onMessage(SlackMessageEvent)
+```
+
+## Home Tab (`home.ts`)
+
+Reads `store.getRecent(windowMs)` then renders:
+
+- Summary section (active/idle/draining/errors/muted/total)
+- Active sessions list
+- Recent idle sessions (top 10 by lastActivity)
+- Recent errors (top 5)
+
+Each session block is intentionally compact: status, agent, provider, repo, last-activity, pending count, and agent count. Long details (worktree path, resume command, `agentSessions[*]` resume/status rows, last error) live behind the `home_session_details` button, which opens a Slack modal for a single thread. Home rows and modal sections are capped below Slack's 3000-character section-text limit so `views.publish` / `views.open` do not fail with `invalid_arguments`. Last-error text is sanitized with `sanitizeErrorForSlack` before rendering so stored provider errors cannot leak injected prompt/context through Home or modals.
+
+## Key Concepts
+
+### Loop prevention + directive escape
+
+Bolt's default `ignoreSelf: true` is disabled so lead's posted `!<agent>` directives are observable. `events.ts` re-enforces the loop guard but lets through self-bot messages in auto-trigger channels OR messages with a `!<persistent-agent>` line.
+
+### Foreign-bot thinking filter
+
+Friday and Doraemon stream "✽ Thinking…" updates. `isForeignBotThinking` drops messages that start with `✽` — they're not user input.
+
+### Session-gated threads
+
+In a thread reply (not DM, not auto-trigger), the handler skips messages whose `thread_ts` has no row in the session store. This prevents random thread chatter from spawning Claude.
+
+### Cross-thread permalink context
+
+Ingress recognizes canonical Slack archive URLs on the workspace origin
+returned by Slack `auth.test` and resolves up to three unique links before
+dispatch. Arbitrary hosts are rejected. Each lookup is capped to one exact
+message history read plus an eight-message reply window, and the final quoted
+context is capped at 6,000 characters. The resolver escapes structural
+delimiters and treats Slack permission/API failures as a best-effort miss, so
+the original message still routes. The runner's no-read rule is scoped to the
+current thread; the injected `<referenced-slack-context>` is the only
+server-fetched cross-thread context supplied for that turn.
+
+### Dedupe via `dedupeKey`
+
+`SlackMessageEvent` carries an optional `dedupeKey`. `AgentDispatcher` sets it per-dispatched-agent so the same Slack message can fan out to multiple persistent agents in parallel without the `seenMessages` cache in `SessionManager` collapsing them.
+
+## Dependencies
+
+- **Uses**: `@slack/bolt`, `SessionStore` (thread-session lookup), `parseCommand`, `support/agents.isPersistentAgent`
+- **Used by**: `index.ts` (registration + dispatcher wiring)

@@ -1,0 +1,46 @@
+{
+  "name": "junior",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "codex:release-gate": "CODEX_APP_SMOKE_RELEASE_GATE=1 node scripts/codex-app-server-smoke.mjs",
+    "cleanup": "bun run src/lifecycle/cleanup.ts",
+    "mixpanel:oauth": "bun run src/mcp/mixpanel-oauth-cli.ts",
+    "memory:reembed": "bun run src/memory/reembed-retrieval.ts",
+    "memory:benchmark:lesson-cues": "bun run src/memory/lesson-retrieval-benchmark.ts",
+    "memory:replay": "bun test src/memory/historical-replay.test.ts",
+    "slack:archive:import": "bun run src/slack/archive-cli.ts import",
+    "slack:archive:embed": "bun run src/slack/archive-cli.ts embed",
+    "slack:archive:index": "bun run src/slack/archive-cli.ts index",
+    "slack:identity:setup": "bun run src/slack/identity-cli.ts setup",
+    "slack:identity:doctor": "bun run src/slack/identity-cli.ts doctor",
+    "migrate:prune-routing-logs": "bun run src/memory/migrations/2026-06-13-prune-routing-decision-logs.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@playwright/mcp": "^0.0.70",
+    "@slack/bolt": "^4.3.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "baileys": "^7.0.0-rc14",
+    "cron-parser": "^5.5.0",
+    "proper-lockfile": "^4.1.2",
+    "qrcode-terminal": "^0.12.0",
+    "three": "^0.185.1",
+    "usearch": "2.26.0",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.8.0"
+  },
+  "trustedDependencies": [
+    "onnxruntime-node"
+  ]
+}

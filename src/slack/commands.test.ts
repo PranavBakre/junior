@@ -1,0 +1,139 @@
+import { describe, it, expect } from "bun:test";
+import { parseCommand } from "./commands.ts";
+
+describe("parseCommand", () => {
+  it("parses a command with text", () => {
+    expect(parseCommand("!build fix auth")).toEqual({
+      command: "build",
+      text: "fix auth",
+    });
+  });
+
+  it("parses a command with no text (reset)", () => {
+    expect(parseCommand("!reset")).toEqual({
+      command: "reset",
+      text: "",
+    });
+  });
+
+  it("does NOT parse !review as a command (review is a persistent-agent directive)", () => {
+    expect(parseCommand("!review")).toEqual({
+      command: null,
+      text: "!review",
+    });
+  });
+
+  it("returns null command for unknown command", () => {
+    expect(parseCommand("!unknown hello")).toEqual({
+      command: null,
+      text: "!unknown hello",
+    });
+  });
+
+  it("returns null command for text without ! prefix", () => {
+    expect(parseCommand("hello world")).toEqual({
+      command: null,
+      text: "hello world",
+    });
+  });
+
+  it("treats unambiguous standalone stop requests as !stop", () => {
+    for (const text of ["stop", "stop.", "stop. exit this conversation", "stop the pipeline", "cancel the pipeline"]) {
+      expect(parseCommand(text)).toEqual({ command: "stop", text: "" });
+    }
+    expect(parseCommand("don't stop")).toEqual({ command: null, text: "don't stop" });
+    expect(parseCommand("stop after review")).toEqual({ command: null, text: "stop after review" });
+  });
+
+  it("handles empty string", () => {
+    expect(parseCommand("")).toEqual({
+      command: null,
+      text: "",
+    });
+  });
+
+  it("parses !build with no space (no trailing text)", () => {
+    expect(parseCommand("!build")).toEqual({
+      command: "build",
+      text: "",
+    });
+  });
+
+  it("parses punctuated !aside as aside", () => {
+    expect(parseCommand("!aside. I need to fix both")).toEqual({
+      command: "aside",
+      text: "I need to fix both",
+    });
+  });
+
+  it("parses uppercase !aside as aside", () => {
+    expect(parseCommand("!ASIDE this is a side note")).toEqual({
+      command: "aside",
+      text: "this is a side note",
+    });
+  });
+
+  it("does not parse longer !aside-like words as aside", () => {
+    expect(parseCommand("!asider thing")).toEqual({
+      command: null,
+      text: "!asider thing",
+    });
+    expect(parseCommand("!asides thing")).toEqual({
+      command: null,
+      text: "!asides thing",
+    });
+  });
+
+  describe("recognizes all known commands", () => {
+    const knownCommands = [
+      "build",
+      "frontend",
+      "architect",
+      "pm",
+      "reset",
+      "clear",
+      "status",
+      "repo",
+      "branch",
+      "agent",
+      "provider",
+      "quiet",
+      "verbose",
+      "normal",
+      "help",
+      "workflow",
+      "workflows",
+      "adhoc",
+      "bugs",
+      "mute",
+      "unmute",
+    ];
+
+    for (const cmd of knownCommands) {
+      it(`recognizes !${cmd}`, () => {
+        const result = parseCommand(`!${cmd}`);
+        expect(result.command).toBe(cmd);
+      });
+
+      it(`recognizes !${cmd} with text`, () => {
+        const result = parseCommand(`!${cmd} some argument`);
+        expect(result.command).toBe(cmd);
+        expect(result.text).toBe("some argument");
+      });
+    }
+  });
+
+  it("trims trailing text", () => {
+    expect(parseCommand("!build   fix auth  ")).toEqual({
+      command: "build",
+      text: "fix auth",
+    });
+  });
+
+  it("returns full text as-is for unknown command with ! prefix", () => {
+    expect(parseCommand("!foo bar baz")).toEqual({
+      command: null,
+      text: "!foo bar baz",
+    });
+  });
+});

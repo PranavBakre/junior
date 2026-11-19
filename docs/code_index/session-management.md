@@ -1,0 +1,148 @@
+# Code Index: Session Management
+
+Core orchestrator: routes Slack messages through the normalized runner boundary,
+manages the buffer/drain state machine (per-thread for lead/default, per-agent
+for workers), composes prompts with context, dispatches `!` commands, and tracks
+session state.
+
+## Code Index
+
+### src/session
+
+| Symbol | File | Purpose |
+|---|---|---|
+| `SessionManager(store, config, spawnRunner?)` | `manager.ts` | Constructor — runner spawn injectable for tests |
+| `handleMessage(event)` | `manager.ts` | Default single-session entry — any-channel @mentions |
+| `handleLeadMessage(event)` | `manager.ts` | Single-session entry for the support `lead` agent (shares top-level session slot) |
+| `handleAgentMessage(event, agentName)` | `manager.ts` | Persistent-agent entry — per-agent buffer/drain via `session.agentSessions[name]` |
+| `getSession(threadId)` | `manager.ts` | Read accessor |
+| `resetSession(threadId)` | `manager.ts` | Kills handles for the thread, deletes the row |
+| `resetAgent(threadId, agentName)` | `manager.ts` | Resets one agent slice (`lead`/`default` clear top-level fields; others clear `agentSessions[name]`) |
+| `isAdmin(userId)` | `manager.ts` | Env bootstrap admin + `extraAdmins` from store. Open-mode only when both tiers are empty. |
+| `createSession(threadId, channel, defaultVerbosity?)` | `types.ts` | Factory with idle defaults |
+
+### SessionManager callbacks (wired in `index.ts`)
+
+| Callback | When |
+|---|---|
+| `onResponse(session, text)` | Runner turn complete; duplicate Slack-tool posts are suppressed first, then `prepareSlackResponse` runs sentinel handling |
+| `onEvent(session, event)` | Each normalized runner event (status updates) |
+| `onMessageBuffered(event)` | Message buffered while busy → `eyes` reaction |
+| `onCommandResponse(event, text)` | Command (`!status`, `!help`, etc.) returns text |
+| `onReaction(event, emoji)` | Used for admin-denied commands (`x` reaction) |
+| `onTurnReaction(action, channel, ts, emoji)` | Turn-progress marker (`hourglass_flowing_sand`) on the message that started a turn — top-level or a dispatched agent turn carrying its own `event.ts`. Added before pre-turn work (prompt composition, worktree setup, pre-recall), removed in `runRunnerWithAgent`'s `finally` so every terminal path clears it — including the suppressed-response one. Ref-counted per message by `markTurnProgress`, which also requires a real Slack ts shape (`/^\d+\.\d+$/`) — pipeline dispatch and action buttons synthesize `event.ts` as an identity key, and reacting to those only produces error-level noise. Ref-counted because turns overlap on one message (cold-start restart, guard continuation, agent turn beside the top-level one). Wired to `SlackResponder.addReaction` / `removeReaction`, which serialize writes per `channel:ts` so a remove cannot overtake its add. |
+| `onError(session, error)` | Spawn fails or times out |
+
+### SessionManager dependencies
+
+`agentRouter`, `worktreeManager`, `slackApp`, `botUserId` — assigned externally in `index.ts`.
+
+### Data Model
+
+```typescript
+interface ThreadSession {
+  threadId: string;
+  channel: string;
+  provider?: RunnerProvider;               // thread override; config is fallback
+  sessionId: string | null;                // current run's native session ID
+  leadSessionId: string | null;            // pinned to lead's resume target across re-routes
+  agentSessions: Record<string, AgentSession>;  // per-worker state
+  worktreePath: string | null;             // single-repo flow
+  worktreePaths: Record<string, string>;   // multi-repo (bug pipeline)
+  targetRepo: string | null;
+  identityRepo?: string | null;            // repo to authenticate as when no worktree is bound; utility (repo-less) invocations resolve none
+  baseRef: string | null;
+  agentType: string | null;
+  systemPrompt: string | null;
+  activeAgentName?: string;                // run-scoped, set by buildRunSession
+  slackIdentity?: AgentIdentity;           // run-scoped
+  status: "idle" | "busy" | "draining";
+  pendingMessages: PendingMessage[];
+  verbosity: "quiet" | "normal" | "verbose";
+  muted: boolean;
+  model: string | null;
+  cwd: string | null;                       // utility-command override
+  pid: number | null;
+  driverMode: "headless" | "tmux";
+  lastActivity: number; createdAt: number;
+  lastError: { type, message, timestamp } | null;
+  defaultAgent?: "junior" | "lead" | null;  // thread-level !agent override
+}
+
+interface AgentSession {
+  agentName: string;
+  sessionId: string | null;
+  status: "idle" | "busy" | "done" | "failed";
+  pendingMessages: PendingMessage[];
+  lastActivity: number;
+  pid: number | null;
+}
+```
+
+## State Machine
+
+**Top-level** (`lead`/`default` agents — share `session.{status, sessionId, pendingMessages}`):
+
+```
+idle ──[msg]──► busy ──[exit, no pending]──► idle
+                  ├──[msg while busy]──► buffer (eyes reaction)
+                  └──[exit, pending]──► draining ──[combined drain]──► busy
+```
+
+**Per-agent** (workers — each `agentSessions[name]` is independent):
+
+```
+idle ──[msg]──► busy ──[exit, no pending]──► done|failed
+                  ├──[msg while busy]──► buffer (eyes reaction)
+                  └──[exit, pending]──► busy (combined drain stays in 'busy')
+```
+
+## Commands
+
+Handled in `handleCommand`: `build`, `frontend`, `architect`, `pm` (set `agentType`, continue), `repo`, `branch`, `agent`, `provider`, `cancel`, `reset` (admin), `clear` (admin), `status`, `help`, `quiet`/`normal`/`verbose`, `adhoc`/`bugs` (calendar tasks via haiku + cwd override), `mute`/`unmute` (admin), `stop`, and `driver` (admin). See `thread-commands.md`.
+
+## Prompt Composition (in `runRunnerWithAgent`)
+
+1. For an active pipeline assignment, resolve durable repo refs, then provision
+   managed worktrees only when the repo-bound agent role or the assignment's
+   `worktree-code` mutation scope requires them. Orchestrator/planner
+   assignments remain in Junior's control-plane workspace even when the run has
+   repo refs. Otherwise resolve `targetRepo`, create its worktree when absent,
+   or refresh remote refs before reusing it.
+2. Resolve agent definition + context profile (defaults to all-true). Typed
+   worker assignments force `threadHistory:false` because their durable
+   assignment envelope is the compiled handoff; Junior/lead and direct worker
+   turns keep their declared history profile. The assignment envelope also
+   makes its target/objective/scope authoritative over target-repository prompt
+   routing, so a repo-local role label cannot force an unauthorized handoff.
+3. First turn: `buildPromptPreamble(...)` injects enabled blocks
+4. Resumed turn: just `buildWorkspaceBlock` (cheap safety insurance) if workspace flag is on
+5. `resolveSlackMentions` rewrites `<@U…>` → `@Name (<@U…>)`
+6. Download image files → append paths
+7. `composeSystemPrompt` (common + agent body) + identity block + dispatch-allow block → `session.systemPrompt`
+8. Optional `<persistent-agent-state>` block when `context.agentState` is on
+9. Optional pre-recall. Compiled typed worker assignments skip it because
+   Junior's handoff owns recall selection. Junior/lead assignments recall on
+   retry `0`; settlement continuations reuse that context.
+10. Emit content-free `prompt-context` telemetry (character count and block
+    presence), then `spawnRunner(runSession, prompt, ..., agentIdentity)`
+    wrapped in `withTimeout`.
+
+## Concurrency Guards
+
+- **Refetch-then-mutate in `onRunComplete`**: long-running agents may be minutes stale; refetch the row to avoid clobbering writes from other agents on the same thread.
+- **Handle ownership check**: if `this.handles.get(handleKey) !== ownHandle`, the run was replaced by `!reset` or a newer spawn — bail without writing or posting.
+- **Pipeline workspace gate**: only the active assignment inherits fail-closed repo/worktree setup. The trusted agent catalog allows planner/orchestrator roles to run repo-less; builder/reviewer/reproducer and unknown roles require a managed target repo. Later human turns remain usable if the assignment escalates to `needs-human`.
+- **MCP-only Codex isolation**: repo-less MCP-only agents run from an empty,
+  agent-specific runtime directory. Codex adds a read-only sandbox and the
+  capability-scoped MCP catalog, avoiding repository exposure while allowing
+  the same trusted agents to run on the default provider.
+- **Setup settlement containment**: pre-spawn failures attempt durable pipeline settlement, but a store failure during settlement is caught and folded into the normal setup-error path so the session cannot remain stuck `busy`.
+- **Idle interrupt/resume**: for headless CLI providers Junior owns, silent runs are SIGINT'd after `session.idleTimeoutMs`; if a native session id was captured, the retry uses `buildRunSession(...)` so provider-native continuity receives the latest `sessionId`. OpenCode idle recovery is gated by `OPENCODE_CONTINUITY_ENABLED`.
+- **Slack tool duplicate suppression**: if a runner used `slack_send_message` and its final response is the exact same text, skip `onResponse` to avoid double-posting the same Slack reply.
+- **`seenMessages` dedupe**: bounded set (cap 1000, drops oldest 500) keyed on `dedupeKey ?? ts`. Slack fires both `message` and `app_mention` for @mentions.
+
+## Dependencies
+
+- **Uses**: `runners` (provider selection and normalized events), `lifecycle/timeout`, `slack/thread-context` (preamble, mention resolution), `slack/files` (image download), `agents/router`, `agents/loader` (context profile), `worktree/manager`, `support/agents` (identity, dispatch-allow), `session/store`
+- **Used by**: `support/router` (`AgentDispatcher` routes here), `index.ts` (wiring), `lifecycle/shutdown` + `lifecycle/cleanup`

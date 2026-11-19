@@ -1,0 +1,373 @@
+import { CronExpressionParser } from "cron-parser";
+import { log } from "../logger.ts";
+import type { WorkflowExecutor } from "./executor.ts";
+import type { WorkflowRegistry } from "./registry.ts";
+import type { WorkflowStore } from "./store.ts";
+import type {
+  WorkflowDefinition,
+  WorkflowRunReason,
+  WorkflowScheduleTrigger,
+  WorkflowState,
+} from "./types.ts";
+
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+export interface WorkflowSchedulerOptions {
+  registry: WorkflowRegistry;
+  store: WorkflowStore;
+  executor: WorkflowExecutor;
+  now?: () => Date;
+}
+
+export class WorkflowScheduler {
+  private registry: WorkflowRegistry;
+  private store: WorkflowStore;
+  private executor: WorkflowExecutor;
+  private now: () => Date;
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private activeRunCounts = new Map<string, number>();
+
+  constructor(options: WorkflowSchedulerOptions) {
+    this.registry = options.registry;
+    this.store = options.store;
+    this.executor = options.executor;
+    this.now = options.now ?? (() => new Date());
+    this.registry.onEvent((event) => {
+      if (event.type === "reloaded") {
+        this.reconcile(event.snapshot).catch((err) => {
+          log.warn("workflow", `scheduler reconcile failed: ${formatError(err)}`);
+        });
+      }
+    });
+  }
+
+  async reconcile(snapshot = this.registry.snapshot()): Promise<void> {
+    const seen = new Set<string>();
+    for (const definition of snapshot.definitions.values()) {
+      seen.add(definition.name);
+      await this.ensureState(definition);
+      await this.schedule(definition);
+    }
+
+    for (const [name, timer] of this.timers) {
+      if (seen.has(name)) continue;
+      clearTimeout(timer);
+      this.timers.delete(name);
+    }
+  }
+
+  async runNow(options: {
+    name: string;
+    reason: WorkflowRunReason;
+    actorSlackUserId?: string | null;
+    triggerContext?: Record<string, unknown> | null;
+    instructions?: string | null;
+  }): Promise<{ summary: string; runId: string }> {
+    const definition = this.registry.get(options.name);
+    if (!definition) throw new Error(`Unknown workflow: ${options.name}`);
+    if (!definition.enabled) {
+      throw new Error(`Workflow ${definition.name} is disabled in its workflow file.`);
+    }
+    const state = await this.ensureState(definition);
+    if (state.status === "invalid") {
+      throw new Error(`Workflow ${definition.name} is invalid and cannot run.`);
+    }
+    if (state.status === "stopped" && options.reason !== "manual") {
+      throw new Error(`Workflow ${definition.name} is stopped. Use !workflow start ${definition.name} to resume triggers.`);
+    }
+    if (!this.tryClaimRun(definition)) {
+      await this.markSkipped(state, "Workflow already running.");
+      return { summary: `Skipped *${definition.name}*: already running.`, runId: "" };
+    }
+    try {
+      const result = await this.executor.run({
+        definition,
+        reason: options.reason,
+        actorSlackUserId: options.actorSlackUserId ?? null,
+        triggerContext: options.triggerContext ?? null,
+        instructions: options.instructions ?? null,
+      });
+      await this.schedule(definition);
+      return { summary: result.summary, runId: result.run.id };
+    } finally {
+      this.releaseRun(definition);
+    }
+  }
+
+  async enqueueManualRun(options: {
+    name: string;
+    actorSlackUserId?: string | null;
+    instructions?: string | null;
+  }): Promise<
+    | { status: "skipped"; runId: ""; summary: string }
+    | { status: "started"; runId: string; summary: string }
+  > {
+    const definition = this.registry.get(options.name);
+    if (!definition) throw new Error(`Unknown workflow: ${options.name}`);
+    if (!definition.enabled) {
+      throw new Error(`Workflow ${definition.name} is disabled in its workflow file.`);
+    }
+    const state = await this.ensureState(definition);
+    if (state.status === "invalid") {
+      throw new Error(`Workflow ${definition.name} is invalid and cannot run.`);
+    }
+    if (!this.tryClaimRun(definition)) {
+      await this.markSkipped(state, "Workflow already running.");
+      return {
+        status: "skipped",
+        runId: "",
+        summary: `Skipped *${definition.name}*: already running.`,
+      };
+    }
+    try {
+      const request = {
+        definition,
+        reason: "manual" as const,
+        actorSlackUserId: options.actorSlackUserId ?? null,
+        instructions: options.instructions ?? null,
+      };
+      const run = await this.executor.persistNewRun(request);
+      // releaseRun hangs on execute, not enqueue. schedule is not on this chain.
+      void this.executor.executePersistedRun(run, request)
+        .then(() => {
+          this.schedule(definition).catch((err) => {
+            log.warn(
+              "workflow",
+              `continuation schedule failed workflow=${definition.name}: ${formatError(err)}`,
+            );
+          });
+        })
+        .catch(async (err) => {
+          try {
+            const latest = await this.store.getState(definition.name);
+            if (!latest) return;
+            await this.store.setState({
+              ...latest,
+              lastError: formatError(err),
+              lastRunStatus: "failed",
+              lastRunAt: this.now().getTime(),
+            });
+          } catch (storeErr) {
+            log.warn(
+              "workflow",
+              `failed-run status persist failed workflow=${definition.name}: ${formatError(storeErr)}`,
+            );
+          }
+        })
+        .finally(() => {
+          this.releaseRun(definition);
+        });
+      return {
+        status: "started",
+        runId: run.id,
+        summary: `Started *${definition.name}*.`,
+      };
+    } catch (err) {
+      this.releaseRun(definition);
+      throw err;
+    }
+  }
+
+  activeRunCount(name: string): number {
+    return this.activeRunCounts.get(name) ?? 0;
+  }
+
+  async stopWorkflow(name: string): Promise<void> {
+    const definition = this.registry.get(name);
+    const state = definition
+      ? await this.ensureState(definition)
+      : await this.store.getState(name);
+    if (!state) throw new Error(`Unknown workflow: ${name}`);
+    await this.store.setState({ ...state, status: "stopped", nextRunAt: null });
+    this.cancel(name);
+  }
+
+  async startWorkflow(name: string): Promise<void> {
+    const definition = this.registry.get(name);
+    if (!definition) throw new Error(`Unknown workflow: ${name}`);
+    if (!definition.enabled) {
+      throw new Error(`Workflow ${name} is disabled in its workflow file. Change enabled to true before starting it.`);
+    }
+    const state = await this.ensureState(definition);
+    await this.store.setState({
+      ...state,
+      status: "active",
+      activeVersionHash: definition.versionHash,
+      sourcePath: definition.sourcePath,
+      lastLoadedAt: this.now().getTime(),
+      lastError: null,
+    });
+    await this.schedule(definition);
+  }
+
+  stop(): void {
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+  }
+
+  async shutdown(): Promise<void> {
+    this.stop();
+    await this.executor.terminateActiveRuns();
+  }
+
+  isRunning(name: string): boolean {
+    return (this.activeRunCounts.get(name) ?? 0) > 0;
+  }
+
+  private async schedule(definition: WorkflowDefinition): Promise<void> {
+    this.cancel(definition.name);
+    const state = await this.ensureState(definition);
+    if (!definition.enabled || state.status !== "active") {
+      await this.store.setState({ ...state, nextRunAt: null });
+      return;
+    }
+
+    const next = nextScheduledRun(definition, this.now());
+    if (!next) {
+      await this.store.setState({ ...state, nextRunAt: null });
+      return;
+    }
+
+    const delay = Math.max(0, next.getTime() - this.now().getTime());
+    const timer = setTimeout(() => {
+      this.timers.delete(definition.name);
+      const currentDelay = Math.max(0, next.getTime() - this.now().getTime());
+      if (currentDelay > 0) {
+        this.schedule(definition).catch((err) => {
+          log.warn("workflow", `continuation schedule failed workflow=${definition.name}: ${formatError(err)}`);
+        });
+        return;
+      }
+      this.handleScheduledRun(definition.name).catch((err) => {
+        log.warn("workflow", `scheduled run failed workflow=${definition.name}: ${formatError(err)}`);
+      });
+    }, timerDelayFor(delay));
+    this.timers.set(definition.name, timer);
+    await this.store.setState({ ...state, nextRunAt: next.getTime() });
+  }
+
+  private async handleScheduledRun(name: string): Promise<void> {
+    const definition = this.registry.get(name);
+    if (!definition) return;
+    const state = await this.ensureState(definition);
+    if (!definition.enabled || state.status !== "active") {
+      await this.schedule(definition);
+      return;
+    }
+    if (!this.tryClaimRun(definition)) {
+      await this.markSkipped(state, "Scheduled run overlapped an active run.");
+      await this.schedule(definition);
+      return;
+    }
+    try {
+      await this.executor.run({
+        definition,
+        reason: "schedule",
+        actorSlackUserId: null,
+      });
+    } catch (err) {
+      const latest = await this.store.getState(definition.name);
+      if (latest) {
+        await this.store.setState({
+          ...latest,
+          lastError: formatError(err),
+          lastRunStatus: "failed",
+          lastRunAt: this.now().getTime(),
+        });
+      }
+    } finally {
+      this.releaseRun(definition);
+    }
+    await this.schedule(definition);
+  }
+
+  private async ensureState(definition: WorkflowDefinition): Promise<WorkflowState> {
+    const existing = await this.store.getState(definition.name);
+    const now = this.now().getTime();
+    const base: WorkflowState = {
+      name: definition.name,
+      status: definition.enabled ? "active" : "stopped",
+      activeVersionHash: definition.versionHash,
+      sourcePath: definition.sourcePath,
+      lastLoadedAt: now,
+      nextRunAt: null,
+      lastRunAt: null,
+      lastRunStatus: null,
+      lastError: null,
+    };
+    if (!existing) {
+      await this.store.setState(base);
+      return base;
+    }
+
+    const status = definition.enabled ? existing.status : "stopped";
+    const next = {
+      ...existing,
+      status,
+      activeVersionHash: definition.versionHash,
+      sourcePath: definition.sourcePath,
+      lastLoadedAt: now,
+    };
+    if (
+      next.status !== existing.status ||
+      next.activeVersionHash !== existing.activeVersionHash ||
+      next.sourcePath !== existing.sourcePath
+    ) {
+      await this.store.setState(next);
+    }
+    return next;
+  }
+
+  private async markSkipped(state: WorkflowState, message: string): Promise<void> {
+    await this.store.setState({
+      ...state,
+      lastRunAt: this.now().getTime(),
+      lastRunStatus: "skipped",
+      lastError: message,
+    });
+  }
+
+  private cancel(name: string): void {
+    const timer = this.timers.get(name);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.timers.delete(name);
+  }
+
+  private tryClaimRun(definition: WorkflowDefinition): boolean {
+    const activeRuns = this.activeRunCounts.get(definition.name) ?? 0;
+    if (definition.concurrency === "skip" && activeRuns > 0) return false;
+    this.activeRunCounts.set(definition.name, activeRuns + 1);
+    return true;
+  }
+
+  private releaseRun(definition: WorkflowDefinition): void {
+    const activeRuns = this.activeRunCounts.get(definition.name) ?? 0;
+    if (activeRuns <= 1) this.activeRunCounts.delete(definition.name);
+    else this.activeRunCounts.set(definition.name, activeRuns - 1);
+  }
+}
+
+export function nextScheduledRun(
+  definition: WorkflowDefinition,
+  now = new Date(),
+): Date | null {
+  const candidates = definition.triggers
+    .filter((trigger): trigger is WorkflowScheduleTrigger => trigger.type === "schedule")
+    .map((trigger) =>
+      CronExpressionParser.parse(trigger.cron, {
+        tz: trigger.timezone,
+        currentDate: now,
+      }).next().toDate(),
+    )
+    .sort((a, b) => a.getTime() - b.getTime());
+  return candidates[0] ?? null;
+}
+
+export function timerDelayFor(delayMs: number): number {
+  return Math.min(Math.max(0, delayMs), MAX_TIMER_DELAY_MS);
+}
+
+function formatError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

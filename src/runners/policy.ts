@@ -1,0 +1,375 @@
+/**
+ * Provider-neutral permission compiler.
+ *
+ * Resolves an agent's effective permission intent from (in order):
+ *   1. Explicit session/frontmatter `permissions.intent` when it does not
+ *      widen the trusted catalog ceiling
+ *   2. Trusted agent catalog compiled from agent Markdown frontmatter
+ *   3. null → provider "normal" defaults
+ *
+ * Compiles that intent into Claude / OpenCode / Codex policy surfaces via
+ * the existing per-provider mappers (Claude + Codex) and an OpenCode
+ * permission object map defined here.
+ *
+ * Claude has no OS-level filesystem sandbox — do not claim worktree
+ * confinement the provider cannot enforce. Use tool restrictions, registered
+ * working directories, capability-scoped MCP, and human gates.
+ */
+
+import type { Config } from "../config.ts";
+import {
+  resolveEffectivePermissionIntent,
+  type AgentPermissionIntent,
+  type AgentPermissions,
+} from "../agents/loader.ts";
+import {
+  listCatalogAgents,
+  resolveAgentManifest,
+} from "../agents/registry.ts";
+import { createSession, type ThreadSession } from "../session/types.ts";
+import { mapClaudeRunPolicy, type ClaudeRunPolicy } from "../claude/policy.ts";
+import {
+  mapCodexRunPolicy,
+  type CodexRunPolicy,
+} from "../codex-app-server/policy.ts";
+import type { OpenCodePermissionConfig } from "../opencode/config.ts";
+import { subjectHasCapability } from "../agents/capabilities.ts";
+import {
+  GITHUB_POST_REVIEW_TOOL,
+  GITHUB_READ_REVIEW_STATE_TOOL,
+} from "../github/review-comments.ts";
+import {
+  reviewInspectionCommandPatterns,
+  worktreeInspectionCommandPatterns,
+  worktreeVerificationCommandPatterns,
+} from "../agents/verification.ts";
+
+export interface PermissionSubject {
+  agentPermissions?: AgentPermissions;
+  activeAgentName?: string | null;
+  agentType?: string | null;
+  worktreePath?: string | null;
+  worktreePaths?: Record<string, string>;
+  verificationPackageManager?: ThreadSession["verificationPackageManager"];
+  assignmentCapabilities?: ThreadSession["assignmentCapabilities"];
+}
+
+/**
+ * Resolve the effective permission intent for a session/agent.
+ * Delegates to loader.resolveEffectivePermissionIntent (catalog-aware).
+ */
+export function resolveRunPermissionIntent(
+  subject: PermissionSubject,
+): AgentPermissionIntent | null {
+  return resolveEffectivePermissionIntent(
+    subject.agentPermissions,
+    subject.activeAgentName ?? subject.agentType,
+  );
+}
+
+/**
+ * Read-safe MCP tools for read-only / human-gated agents.
+ * Product-mutating Slack/memory/dispatch tools are NOT included. The bounded
+ * memory feedback counter is telemetry and is safe for read-only agents.
+ */
+export const READ_SAFE_MCP_PERMISSIONS: Record<string, string> = {
+  "mcp__mongodb__aggregate": "allow",
+  "mcp__mongodb__count": "allow",
+  "mcp__mongodb__find": "allow",
+  "mcp__mongodb__list-databases": "allow",
+  "mcp__mongodb__list-collections": "allow",
+  "mcp__mongodb__collection-schema": "allow",
+  "mcp__slack-bot__slack_read_thread": "allow",
+  "mcp__slack-bot__slack_read_channel": "allow",
+  "mcp__slack-bot__slack_search": "allow",
+  "mcp__slack-bot__slack_search_users": "allow",
+  "mcp__slack-bot__memory_recall": "allow",
+  "mcp__slack-bot__memory_feedback": "allow",
+  "mcp__slack-bot__runbook_search": "allow",
+  "mcp__slack-bot__runbook_select": "allow",
+  "mcp__slack-bot__register_worktree": "allow",
+  "mcp__slack-bot__pipeline_get_state": "allow",
+  [GITHUB_READ_REVIEW_STATE_TOOL]: "allow",
+  "mcp__playwright__*": "allow",
+};
+
+/**
+ * OpenCode permission surface for a given intent.
+ *
+ * - read-only / no-tools: deny edit/write/task; no-tools also denies bash + MCP
+ * - human-gated: ask on mutating tools
+ * - normal / utility / null: use the configured fallback (typically "allow")
+ *
+ * Reviewers receive granular verification commands only when a managed
+ * worktree is registered and its package manager is unambiguous; arbitrary
+ * Bash remains denied.
+ */
+export function compileOpenCodePermission(options: {
+  subject: PermissionSubject;
+  cwd?: string;
+  fallback?: OpenCodePermissionConfig;
+}): OpenCodePermissionConfig {
+  const intent = resolveRunPermissionIntent(options.subject);
+  const fallback = options.fallback ?? "allow";
+  const capabilityPermissions: Record<string, string> = {
+    ...(subjectHasCapability(options.subject, "github-review-comment")
+      ? { [GITHUB_POST_REVIEW_TOOL]: "allow" }
+      : {}),
+    ...(subjectHasCapability(options.subject, "pipeline-artifact-write")
+      ? {
+          "mcp__slack-bot__pipeline_get_state": "allow",
+          "mcp__slack-bot__pipeline_report_outcome": "allow",
+          "mcp__slack-bot__pipeline_write_artifact": "allow",
+        }
+      : {}),
+    ...(subjectHasCapability(options.subject, "mongodb-read")
+      ? {
+          "mcp__mongodb__aggregate": "allow",
+          "mcp__mongodb__count": "allow",
+          "mcp__mongodb__find": "allow",
+          "mcp__mongodb__list-databases": "allow",
+          "mcp__mongodb__list-collections": "allow",
+          "mcp__mongodb__collection-schema": "allow",
+        }
+      : {}),
+    ...(subjectHasCapability(options.subject, "dispatch")
+      ? {
+          "mcp__slack-bot__agent_dispatch": "allow",
+          "mcp__slack-bot__skill_dispatch": "allow",
+        }
+      : {}),
+    ...(subjectHasCapability(options.subject, "pipeline-run-start")
+      ? { "mcp__slack-bot__pipeline_start_run": "allow" }
+      : {}),
+    ...(subjectHasCapability(options.subject, "worktree-mutate")
+      ? { "mcp__slack-bot__unregister_worktree": "allow" }
+      : {}),
+  };
+  const declaredBashPatterns = (options.subject.agentPermissions?.tools ?? [])
+    .map((tool) => /^Bash\((.+)\)$/.exec(tool)?.[1])
+    .filter((pattern): pattern is string => Boolean(pattern));
+  const declaredMcpPermissions = Object.fromEntries(
+    (options.subject.agentPermissions?.tools ?? [])
+      .filter((tool) => tool.startsWith("mcp__"))
+      .map((tool) => [tool, "allow"]),
+  );
+  const worktreeRoots = [
+    options.subject.worktreePath,
+    ...Object.values(options.subject.worktreePaths ?? {}),
+  ].filter((root): root is string => Boolean(root));
+  const mayInspect = subjectHasCapability(options.subject, "worktree-verify");
+  const mayUseGitHubCli = subjectHasCapability(
+    options.subject,
+    "github-review-comment",
+  );
+  const hasRegisteredWorktreeCwd =
+    Boolean(options.cwd) &&
+    worktreeRoots.includes(options.cwd!);
+
+  if (intent === "no-tools") {
+    return {
+      read: "deny",
+      glob: "deny",
+      grep: "deny",
+      edit: "deny",
+      write: "deny",
+      bash: "deny",
+      task: "deny",
+      "mcp__*": "deny",
+      "*": "deny",
+    };
+  }
+
+  if (intent === "mcp-only") {
+    const declaredMcpPermissions = Object.fromEntries(
+      (options.subject.agentPermissions?.tools ?? [])
+        .filter((tool) => tool.startsWith("mcp__"))
+        .map((tool) => [tool, "allow"]),
+    );
+    return {
+      read: "deny",
+      glob: "deny",
+      grep: "deny",
+      list: "deny",
+      edit: "deny",
+      write: "deny",
+      bash: "deny",
+      task: "deny",
+      "*": "deny",
+      // OpenCode resolves permission patterns last-match-wins. The wildcard
+      // denial must precede the exact trusted MCP grants.
+      "mcp__*": "deny",
+      ...declaredMcpPermissions,
+      ...capabilityPermissions,
+    };
+  }
+
+  if (intent === "read-only") {
+    return {
+      read: "allow",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      edit: "deny",
+      write: "deny",
+      bash: mayInspect || declaredBashPatterns.length > 0
+        ? Object.fromEntries([
+            ["*", "deny"],
+            ...declaredBashPatterns.map((pattern) => [pattern, "allow"]),
+            ...(mayInspect
+              ? hasRegisteredWorktreeCwd && options.subject.verificationPackageManager
+                ? worktreeVerificationCommandPatterns(
+                    options.subject.verificationPackageManager,
+                  )
+                : hasRegisteredWorktreeCwd
+                  ? worktreeInspectionCommandPatterns()
+                  : reviewInspectionCommandPatterns()
+              : []
+            ).map(
+              (pattern) => [pattern, "allow"],
+            ),
+            ...(mayUseGitHubCli ? [["gh *", "allow"]] : []),
+          ])
+        : "deny",
+      task: "deny",
+      // Explicit read-safe MCP surface only — never blanket mcp__*.
+      "mcp__*": "deny",
+      ...READ_SAFE_MCP_PERMISSIONS,
+      ...declaredMcpPermissions,
+      ...capabilityPermissions,
+    };
+  }
+
+  if (intent === "human-gated") {
+    return {
+      read: "allow",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      edit: "ask",
+      write: "ask",
+      bash: "ask",
+      task: "deny",
+      // Human-gated roles may use read MCPs freely; mutating MCP tools ask.
+      ...READ_SAFE_MCP_PERMISSIONS,
+      "mcp__slack-bot__slack_send_message": "ask",
+      "mcp__slack-bot__agent_dispatch": "ask",
+      "mcp__slack-bot__memory_add": "ask",
+      ...capabilityPermissions,
+      "mcp__*": "ask",
+    };
+  }
+
+  // Normal, utility, or unset preserve the operator fallback except for
+  // provider-native fan-out. Junior's durable assignment graph owns all
+  // delegation so every OpenCode runtime denies Task.
+  return typeof fallback === "string"
+    ? { "*": fallback, task: "deny" }
+    : { ...fallback, task: "deny" };
+}
+
+/** Compile Claude run policy from session + config. */
+export function compileClaudePolicy(options: {
+  config: Config["claude"];
+  session: ThreadSession;
+  cwd: string;
+}): ClaudeRunPolicy {
+  return mapClaudeRunPolicy(options);
+}
+
+/** Compile Codex run policy from session + config. */
+export function compileCodexPolicy(options: {
+  config: Config["codex"];
+  session: ThreadSession;
+  cwd: string;
+}): CodexRunPolicy {
+  return mapCodexRunPolicy(options);
+}
+
+/**
+ * Provider-parity matrix entry for tests and diagnostics.
+ * One row per catalog role × resolved intent.
+ */
+export interface PermissionMatrixRow {
+  agentName: string;
+  intent: AgentPermissionIntent;
+  openCode: OpenCodePermissionConfig;
+  claudePermissionMode: string;
+  codexSandbox: string;
+}
+
+/**
+ * Build the permission compilation matrix for all trusted catalog roles.
+ * Used by tests to lock provider parity.
+ */
+export function buildPermissionMatrix(options: {
+  claudeConfig: Config["claude"];
+  codexConfig: Config["codex"];
+  cwd?: string;
+  openCodeFallback?: OpenCodePermissionConfig;
+}): PermissionMatrixRow[] {
+  const cwd = options.cwd ?? "/repo";
+  const rows: PermissionMatrixRow[] = [];
+
+  for (const manifest of listCatalogAgents()) {
+    const threadSession = createSession("matrix", "matrix");
+    threadSession.agentPermissions = {
+      intent: null,
+      mcp: [],
+      tools: [],
+    };
+    threadSession.activeAgentName = manifest.name;
+    threadSession.agentType = manifest.name;
+
+    const intent =
+      resolveRunPermissionIntent(threadSession) ?? manifest.permissionIntent;
+
+    const claude = mapClaudeRunPolicy({
+      config: options.claudeConfig,
+      session: threadSession,
+      cwd,
+    });
+    const codex = mapCodexRunPolicy({
+      config: options.codexConfig,
+      session: threadSession,
+      cwd,
+    });
+    const openCode = compileOpenCodePermission({
+      subject: threadSession,
+      cwd,
+      fallback: options.openCodeFallback ?? "allow",
+    });
+
+    rows.push({
+      agentName: manifest.name,
+      intent,
+      openCode,
+      claudePermissionMode: claude.permissionMode,
+      codexSandbox: codex.sandbox,
+    });
+  }
+
+  return rows;
+}
+
+/** Catalog role names expected to resolve consistently across providers. */
+export const CATALOG_ROLE_NAMES = Object.freeze(
+  listCatalogAgents().map((manifest) => manifest.name),
+);
+
+/**
+ * Assert a target-repo style override cannot widen catalog intent.
+ * Returns the effective intent after clamping.
+ */
+export function effectiveIntentAgainstCatalog(
+  agentName: string,
+  declared: AgentPermissionIntent | null,
+): AgentPermissionIntent | null {
+  const manifest = resolveAgentManifest(agentName);
+  if (!manifest) return declared;
+  // Re-use loader path via a synthetic permissions object.
+  return resolveEffectivePermissionIntent(
+    { intent: declared, mcp: [], tools: [] },
+    agentName,
+  );
+}

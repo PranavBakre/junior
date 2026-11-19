@@ -1,0 +1,159 @@
+import { Database } from "bun:sqlite";
+import { dirname } from "node:path";
+import { mkdirSync } from "node:fs";
+
+export type SlackPermalinkResolve = (
+  channel: string,
+  messageTs: string,
+) => Promise<string | null>;
+
+export type SlackPermalinkLookup = (
+  channel: string,
+  messageTs: string,
+) => string | null;
+
+export interface SlackPermalinkRecordStore {
+  get(channel: string, messageTs: string): string | null;
+  set(channel: string, messageTs: string, permalink: string): void;
+}
+
+// A resolved permalink never changes for a given (channel, ts), so misses are
+// the only thing that needs a TTL.
+const NEGATIVE_TTL_MS = 60_000;
+
+export class SqliteSlackPermalinkStore implements SlackPermalinkRecordStore {
+  private db: Database;
+
+  constructor(dbPathOrDb: string | Database) {
+    if (typeof dbPathOrDb === "string") {
+      mkdirSync(dirname(dbPathOrDb), { recursive: true });
+      this.db = new Database(dbPathOrDb);
+      this.db.run("PRAGMA journal_mode = WAL");
+      this.db.run("PRAGMA synchronous = NORMAL");
+    } else {
+      this.db = dbPathOrDb;
+    }
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS slack_permalinks (
+        channel_id TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        permalink TEXT NOT NULL,
+        resolved_at INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_ts)
+      )
+    `);
+  }
+
+  get(channel: string, messageTs: string): string | null {
+    const row = this.db
+      .query<{ permalink: string }, [string, string]>(
+        "SELECT permalink FROM slack_permalinks WHERE channel_id = ? AND message_ts = ?",
+      )
+      .get(channel, messageTs);
+    return row?.permalink ?? null;
+  }
+
+  set(channel: string, messageTs: string, permalink: string): void {
+    this.db.run(
+      `INSERT INTO slack_permalinks (channel_id, message_ts, permalink, resolved_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(channel_id, message_ts) DO UPDATE SET
+         permalink = excluded.permalink,
+         resolved_at = excluded.resolved_at`,
+      [channel, messageTs, permalink, Date.now()],
+    );
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}
+
+export class SlackPermalinkCache {
+  private hits = new Map<string, string>();
+  private misses = new Map<string, number>();
+  private inFlight = new Map<string, Promise<string | null>>();
+  private resolveFn: SlackPermalinkResolve;
+  private store?: SlackPermalinkRecordStore;
+  private now: () => number;
+
+  constructor(deps: {
+    resolve: SlackPermalinkResolve;
+    store?: SlackPermalinkRecordStore;
+    now?: () => number;
+  }) {
+    this.resolveFn = deps.resolve;
+    this.store = deps.store;
+    this.now = deps.now ?? Date.now;
+  }
+
+  lookup(channel: string, messageTs: string): string | null {
+    if (!channel || !messageTs) return null;
+    const key = cacheKey(channel, messageTs);
+    const cached = this.hits.get(key);
+    if (cached) return cached;
+
+    let stored: string | null = null;
+    try {
+      stored = this.store?.get(channel, messageTs) ?? null;
+    } catch {
+      stored = null;
+    }
+    if (stored) this.hits.set(key, stored);
+    return stored;
+  }
+
+  async resolve(channel: string, messageTs: string): Promise<string | null> {
+    if (!channel || !messageTs) return null;
+    const key = cacheKey(channel, messageTs);
+
+    const cached = this.lookup(channel, messageTs);
+    if (cached) return cached;
+
+    const missedAt = this.misses.get(key);
+    if (missedAt !== undefined) {
+      if (this.now() - missedAt < NEGATIVE_TTL_MS) return null;
+      this.misses.delete(key);
+    }
+
+    const pending = this.inFlight.get(key);
+    if (pending) return await pending;
+
+    const request = this.fetch(channel, messageTs, key);
+    this.inFlight.set(key, request);
+    try {
+      return await request;
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  private async fetch(
+    channel: string,
+    messageTs: string,
+    key: string,
+  ): Promise<string | null> {
+    let permalink: string | null = null;
+    try {
+      permalink = await this.resolveFn(channel, messageTs);
+    } catch {
+      permalink = null;
+    }
+    if (!permalink) {
+      this.misses.set(key, this.now());
+      return null;
+    }
+    this.hits.set(key, permalink);
+    try {
+      this.store?.set(channel, messageTs, permalink);
+    } catch {
+      // The in-memory layer still serves this process; persistence is an
+      // optimisation across restarts, not a correctness requirement.
+    }
+    return permalink;
+  }
+}
+
+function cacheKey(channel: string, messageTs: string): string {
+  return [channel, messageTs].join(":");
+}

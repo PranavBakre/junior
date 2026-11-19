@@ -1,0 +1,94 @@
+# Code Index: Worktree Manager
+
+Creates, removes, and inspects git worktrees in target repos for per-thread code isolation. Supports inline `git worktree add`, delegated setup scripts, and repo-scoped GitHub CLI identities.
+
+## Code Index
+
+### src/worktree
+
+| Symbol | File | Purpose |
+|---|---|---|
+| `WorktreeManager(repos, options?)` | `manager.ts` | Constructor — keeps `RepoConfig[]`; options support deterministic disk-headroom tests and an injectable repo-scoped GitHub auth resolver. |
+| `createWorktree(repoName, threadId, baseRef?, branchOverride?)` | `manager.ts` | Creates worktree. `baseRef` defaults to `repo.defaultBase`. `branchOverride` defaults to `slack/<threadId>`. Returns absolute path. |
+| `removeWorktree(repoName, threadId, { force? })` | `manager.ts` | `git worktree remove` (force by default; safe cleanup can omit `--force`) + `git branch -D`, then verifies both registry absence and filesystem absence (queries actual branch name first to handle `branchOverride`) |
+| `worktreeExists(repoName, threadId)` | `manager.ts` | Filesystem check via `node:fs/promises.stat` |
+| `isWorktreeDirty(worktreePath)` | `manager.ts` | `git status --porcelain` |
+| `getWorktreeStatus(worktreePath, repoName?)` | `manager.ts` | Reports tracked/untracked changes, unpushed commits, and ignored dotenv paths (path names only; contents are never read). |
+| `getWorktreePath(repoName, threadId)` | `manager.ts` | `<repo.path>.junior-worktrees/slack-<threadId>` — sibling, NOT under `.claude/` |
+| `getBranchName(threadId)` | `manager.ts` | `slack/<threadId>` |
+| `getRepo(name)` | `manager.ts` | Lookup in `repos` |
+| `getGitHubEnvironment(name)` | `manager.ts` | Resolve the configured repo `githubUser` into a verified child-process environment |
+
+## Layout
+
+```
+<repo>.junior-worktrees/
+  ├── slack-1234567890.123456/    ← thread A's worktree
+  ├── slack-9876543210.654321/    ← thread B's worktree
+  └── slack-dev-server/           ← shared dev-server worktree (DevServerManager)
+```
+
+Default branch: `slack/<threadId>` off `repo.defaultBase`.
+
+## Setup-script delegation
+
+When `repo.worktreeSetupCommand` is set, Junior calls the script instead of running git inline:
+
+```
+<repo.path>/<command> <branch> --path <abs> --base <ref>
+```
+
+The script owns `git fetch`, `git worktree add`, env copy, install, MCP migration. Junior always passes `--base` (defaults to `repo.defaultBase`) so worktrees are reproducible. When unset, Junior runs `git fetch origin --prune` then `git worktree add <path> -b <branch> <base>` inline.
+
+Junior streams delegated setup stdout and stderr concurrently so chatty installers
+cannot fill a pipe, deadlock, or accumulate unbounded output in memory. On
+failure it surfaces short per-stream tail diagnostics plus a pointer to the
+complete incrementally written `0600` transcript under `logs/worktree-setup/`;
+the bounded outward message remains safe for Slack delivery.
+
+All manager-owned subprocesses go through one bounded executor: each runs
+detached in a process group, drains both streams concurrently into bounded
+tails, and on timeout terminates the process tree before cancelling stream
+readers. This covers the case where a setup wrapper exits but a grandchild
+keeps stdout/stderr open. Git commands default to 30 seconds
+(`WORKTREE_GIT_TIMEOUT_MS`), setup scripts to 15 minutes
+(`WORKTREE_SETUP_TIMEOUT_MS`), and the force-kill grace is 1 second
+(`WORKTREE_TERMINATION_GRACE_MS`). The command environment disables terminal
+prompts, requires batch-mode SSH, and suppresses inherited Git credential
+helpers. When a repo has a verified `GH_TOKEN`, Junior creates a temporary
+0700 askpass helper that supplies GitHub's `x-access-token` username and that
+token for HTTPS authentication; the helper directory is removed after the
+bounded process exits. Without a verified token, Git uses a host-valid false
+askpass executable so private-repo auth fails fast rather than prompting.
+
+Before delegated setup, Junior requires 2 GiB of free space by default (`WORKTREE_SETUP_MIN_FREE_BYTES` overrides it). A script failure after `git worktree add` triggers rollback of the registered worktree and its branch; the surfaced stdout/stderr tails are capped independently.
+
+`scripts/worktree-prune.ts` runs the deterministic prune engine directly
+from `REPOS`, so workflows can perform the routine Git work in one process and
+leave only preservation exceptions and reporting to the runner. The engine
+allows generated PNG artifacts and `next-env.d.ts` as harmless residual state;
+other meaningful changes, ignored dotenv files, locks, active processes, and
+unmerged worktrees remain protected. The Slack cleanup action uses the same
+ignored-dotenv path classifier and refuses cleanup when those paths are
+present, without logging their contents.
+
+## Key Concepts
+
+### Sibling path, NOT under `.claude/`
+
+Setup scripts that `cp -R .claude/.` would otherwise pull every sibling thread's worktree (and the destination itself) into the new worktree — a recursive copy. The trailing-slash strip at both config load and `getWorktreePath` is belt-and-suspenders.
+
+### Always create a worktree
+
+`SessionManager` creates a worktree whenever `session.targetRepo` is set — not gated on agent type. Previously gated on `build`/`frontend`, which let other agents `cwd` into the shared origin repo and modify it.
+
+Durable pipeline assignments use a stricter path: `pipeline-routing.ts` resolves every run `repoRef`, and `SessionManager` provisions every resolved repo before spawning the worker. Concurrent fan-out creation for the same repo/thread is single-flighted. Repo-less orchestration may remain in Junior's workspace, but repo-bound pipeline agents never fall back to the target repo's developer checkout.
+
+### Dirty-check before remove
+
+Callers should inspect preservation state before `removeWorktree` so uncommitted work isn't silently destroyed. The Slack cleanup action and signed MCP `unregister_worktree` tool use `getWorktreeStatus`; the MCP path requires an explicit human-confirmed `discard_changes` override to delete unsafe state. Removal also verifies that Git's registry entry and the filesystem path are both gone; a leftover (for example, an ignored dotenv file) raises an incomplete-cleanup error for preservation review. The cleanup pass in `lifecycle/cleanup.ts` skips busy/draining and deletes only stale idle sessions; worktree removal itself is not currently automatic on cleanup (worktrees outlive the session row).
+
+## Dependencies
+
+- **Uses**: `config.RepoConfig`, `Bun.spawn` (git, optional setup script), `node:fs/promises` (stat)
+- **Used by**: `SessionManager.runRunnerWithAgent` (per-thread and durable pipeline provisioning), `DevServerManager.bootstrap` (shared dev-server worktree), MCP `register_worktree` / `unregister_worktree` tools (explicit/manual lifecycle)

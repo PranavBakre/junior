@@ -1,0 +1,324 @@
+# Project Setup & Configuration
+
+> **Current status (2026-07-21):** The foundation described here is shipped. This page is also a historical record of the original bootstrap plan; for exact current symbols, see [`docs/code_index/project-setup.md`](../code_index/project-setup.md) and [`docs/README.md`](../README.md).
+
+## Problem
+
+The bot needs environment configuration (Slack tokens, repo paths, timeouts) and project scaffolding (package.json, TypeScript config, directory structure) before any feature can be built. This doc covers the foundational setup.
+
+**Who has this problem:** The first developer (Claude or human) who starts building.
+**What happens today:** A Bun/TypeScript Slack service with SQLite-backed sessions, normalized runner providers, dynamic workflows, pipeline stores, MCP tools, optional GitHub reconciliation, and an optional localhost dashboard.
+**Painful part:** Getting the right TypeScript config, ESM vs CJS, which Slack SDK version, how to structure a CLI-spawning server. Wrong choices here cascade into every feature.
+**"Finally" moment:** `bun run dev` starts the bot server. Hot reload works. TypeScript compiles cleanly. Slack connects. Ready to build features.
+
+## Tech Stack
+
+- **Runtime:** Bun (built-in TS, `.env` loading, fast child spawning, `bun:sqlite`, built-in test runner).
+- **Slack SDK:** `@slack/bolt` v4 in Socket Mode — no public URL required.
+- **MCP:** `@modelcontextprotocol/sdk` + `@playwright/mcp` for the bot's own MCP server and browser tooling.
+- **TypeScript:** strict, ESM (`"type": "module"`).
+- **Persistence:** SQLite via `bun:sqlite` (default), in-memory store for tests.
+- **File locking:** `proper-lockfile` for cross-process worktree coordination.
+
+## Entry Point
+
+`src/index.ts` wires everything at boot, in this order:
+
+1. `loadConfig()` — validates env, throws on missing required vars.
+2. Construct `SlackApp`, `SessionStore` (factory picks sqlite/memory), `SessionManager`, `AgentRouter`, `WorktreeManager`, `DevServerManager`, `DevServerQueue`.
+3. Start the internal MCP server (`startMcpServer`) so spawned Claude sessions can post back to threads.
+4. Build the `AgentDispatcher` (support router) over the subset of `CHANNEL_DEFAULTS` whose default agent is `lead`.
+5. Wire `SessionManager` callbacks → `SlackResponder` (`onResponse`, `onEvent`, `onMessageBuffered`, `onCommandResponse`, `onReaction`, `onError`). `prepareSlackResponse` strips the trailing `NO_SLACK_MESSAGE` sentinel; empty/sentinel-only replies are logged and suppressed.
+6. Register the App Home tab and graceful-shutdown hooks.
+7. Start two `setInterval` loops: orphan check (60s) and stale-session cleanup (`SESSION_CLEANUP_INTERVAL_MS`).
+8. Async bootstrap: `loadOverlayIdentities("agents-org")` merges private agent identities from frontmatter (`username`, `iconEmoji`) into `AGENT_IDENTITIES`; `devServerManager.bootstrap()` prepares dev-server worktrees. Both are non-fatal.
+9. `app.start()`, validate the Slack deployment identity via `auth.test`, `users.info`, and joined-channel pagination against the configured/persisted pin, then register event handlers (every message goes through `supportRouter.handleMessage`). A mismatch fails closed.
+10. If `config.http.enabled`, dynamic-import `./http/server.ts` and start the localhost dashboard. Failure is non-fatal — logged so the bot keeps running.
+
+Before first start, pin the intended Slack deployment token and verify it on
+subsequent deploys:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-... bun run slack:identity:setup
+SLACK_BOT_TOKEN=xoxb-... bun run slack:identity:doctor
+```
+
+Startup refuses to register Slack event handlers when the live token differs
+from the configured or persisted user, visible name, workspace, or required
+channel membership.
+
+## Private Org Overlay
+
+The private agent overlay is mounted at `agents-org/`, not under `.claude/`, because it is Junior-owned runtime data rather than a Claude Code native agent directory. Fresh clones initialize it with:
+
+```bash
+git submodule update --init agents-org
+```
+
+Existing checkouts that previously initialized `.claude/agents-org` should run:
+
+```bash
+git submodule deinit .claude/agents-org
+git submodule update --init agents-org
+```
+
+The overlay is optional for public-only development. Missing `agents-org/` degrades to public agent definitions and no private identities.
+
+## Configuration
+
+`src/config.ts` exports `loadConfig(): Config`. Shape:
+
+```typescript
+interface Config {
+  slack: { botToken; appToken; signingSecret };
+  claude: {
+    maxTurns;
+    timeoutMs;
+    permissionMode;
+    defaultModel: string | null;
+    defaultDriver: "headless" | "tmux"; // DEFAULT_CLAUDE_DRIVER (default: "headless")
+    tmuxIdleTtlMs: number;    // TMUX_IDLE_TTL_MS (default: 14400000 — 4h)
+    tmuxSweepIntervalMs: number; // TMUX_SWEEP_INTERVAL_MS (default: 900000 — 15min)
+  };
+  runner: { provider: "claude" | "opencode" | "opencode-sdk" | "codex-app-server" };
+  opencode: {
+    model: string | null;
+    timeoutMs: number;
+    continuityEnabled: boolean;
+    permission: string;
+    mcpEnabled: boolean;
+    slackMcpEnabled: boolean;
+    playwrightMcpEnabled: boolean;
+    mixpanelMcpEnabled: boolean;
+    mongodbMcpEnabled: boolean;
+  };
+  codex: {
+    mode: "app-server" | "cli";
+    model: string | null;
+    timeoutMs: number;
+    sandbox: "read-only" | "workspace-write" | "danger-full-access";
+    askForApproval: "untrusted" | "on-request" | "never";
+    searchEnabled: boolean;
+    appServerContinuityEnabled: boolean;
+    mcpEnabled: boolean;
+    slackMcpEnabled: boolean;
+    playwrightMcpEnabled: boolean;
+    mixpanelMcpEnabled: boolean;
+    mongodbMcpEnabled: boolean;
+    memoryMcpEnabled: boolean;
+    isolatedHomePath: string | null;
+  };
+  repos: RepoConfig[];                  // JSON in REPOS env var
+  session: {
+    staleTimeoutMs; cleanupIntervalMs;
+    store: "memory" | "sqlite";
+    sqlitePath; homeWindowMs;
+    defaultVerbosity: "quiet" | "normal" | "verbose";
+    idleTimeoutMs; maxIdleInterrupts;
+  };
+  memory: {
+    sqlitePath; embedProvider;
+    preRecall?: { enabled; runner; model?; timeoutMs };
+  };
+  threadArchives: { dir };
+  pipeline?: {
+    runtimeMode: "off" | "shadow" | "active";
+    legacyDirectivesEnabled; bugPipelineEnabled;
+    productPipelineEnabled; retentionDays;
+  };
+  github?: {
+    reconcileEnabled; eventWakeEnabled; reconcileToken;
+    reconcileUseCli; reconcileIntervalMs;
+  };
+  channelDefaults: Record<string, { agentType: string }>; // JSON
+  adminSlackUserId: string | null;       // bootstrap admin; rest live in admins table
+  http: { enabled: boolean; port: number };
+}
+```
+
+`RepoConfig` carries `name`, `path`, `defaultBase`, and optional `worktreeSetupCommand`, `devCommand`, `devPort`, `readyUrl`. Repo paths have trailing slashes stripped on load.
+
+### Env vars (see `.env.example` for the full set)
+
+| Var | Required | Default | Notes |
+|---|---|---|---|
+| `SLACK_BOT_TOKEN` | yes | — | |
+| `SLACK_APP_TOKEN` | yes | — | Socket Mode `xapp-...` |
+| `SLACK_SIGNING_SECRET` | no | `""` | only needed if you ever switch to Events API |
+| `SLACK_DEPLOYMENT_IDENTITY_PATH` | no | `data/slack-deployment-identity.json` | Persisted expected Slack token identity used by startup and doctor |
+| `SLACK_EXPECTED_USER_ID` | no | unset | Explicit expected `auth.test.user_id`; overrides the persisted pin |
+| `SLACK_EXPECTED_BOT_ID` | no | unset | Optional expected `auth.test.bot_id` |
+| `SLACK_EXPECTED_TEAM_ID` | no | unset | Optional expected workspace/team ID |
+| `SLACK_EXPECTED_VISIBLE_NAME` | no | unset | Optional exact `users.info` display/visible name |
+| `SLACK_EXPECTED_CHANNEL_IDS` | no | unset | Comma-separated channels the deployment must be joined to |
+| `RUNNER_PROVIDER` | no | `codex-app-server` | `codex-app-server` \| `opencode` \| `opencode-sdk` \| `claude` |
+| `CLAUDE_MAX_TURNS` | no | `100` | Max turns per `claude -p` / `claude -p --resume` invocation |
+| `CLAUDE_TIMEOUT_MS` | no | `300000` | |
+| `CLAUDE_MODEL` | no | unset | passed through to `claude -p --model` |
+| `CLAUDE_PERMISSION_MODE` | no | `bypassPermissions` | |
+| `OPENCODE_MODEL` | no | unset | passed through to `opencode run --model` |
+| `OPENCODE_TIMEOUT_MS` | no | `300000` | |
+| `OPENCODE_CONTINUITY_ENABLED` | no | `false` | enables OpenCode session reuse across completed turns: CLI `--session` and SDK reattach; SDK provider kill still uses native abort, but CLI interrupt-and-resume is not verified |
+| `JUNIOR_OPENCODE_PERMISSION` | no | `allow` | OpenCode permission mode in generated agent config |
+| `OPENCODE_MCP_ENABLED` | no | `true` | enables generated OpenCode MCP config for normal non-utility runs |
+| `OPENCODE_SLACK_MCP_ENABLED` | no | `true` | includes the local Slack MCP entry when MCP is enabled |
+| `OPENCODE_PLAYWRIGHT_MCP_ENABLED` | no | `true` | includes Playwright MCP in generated OpenCode config; set `false` to disable |
+| `OPENCODE_MIXPANEL_MCP_ENABLED` | no | `true` | includes the optional Mixpanel MCP entry |
+| `OPENCODE_MONGODB_MCP_ENABLED` | no | `true` | includes the optional MongoDB MCP entry |
+| `OPENCODE_FIGMA_MCP_ENABLED` | no | `true` | permits the hosted Figma MCP entry when the active agent declares `figma` |
+| `OPENCODE_NOTION_MCP_ENABLED` | no | `true` | permits the hosted Notion MCP entry when the active agent declares `notion` |
+| `CODEX_MODE` | no | `app-server` | Legacy selector; only the app-server transport is supported |
+| `CODEX_MODEL` | no | unset | Codex model override |
+| `CODEX_REASONING_EFFORT` | no | `low` | Codex model reasoning effort |
+| `CODEX_TIMEOUT_MS` | no | `300000` | Codex turn timeout |
+| `CODEX_SANDBOX` | no | `workspace-write` | Codex sandbox policy |
+| `CODEX_ASK_FOR_APPROVAL` | no | `never` | Codex approval policy |
+| `CODEX_SEARCH_ENABLED` | no | `false` | Codex web search capability |
+| `CODEX_APP_SERVER_CONTINUITY_ENABLED` | no | `false` | Reuse Codex app-server sessions when supported |
+| `CODEX_MCP_ENABLED` | no | `true` | Enable generated Codex MCP config |
+| `CODEX_SLACK_MCP_ENABLED` | no | `true` | Include Slack MCP for Codex |
+| `CODEX_PLAYWRIGHT_MCP_ENABLED` | no | `true` | Include Playwright MCP for Codex |
+| `CODEX_MIXPANEL_MCP_ENABLED` | no | `true` | Include Mixpanel MCP for Codex |
+| `CODEX_MONGODB_MCP_ENABLED` | no | `true` | Include MongoDB MCP for Codex |
+| `CODEX_FIGMA_MCP_ENABLED` | no | `true` | Permit the hosted Figma MCP entry when the active agent declares `figma` |
+| `CODEX_NOTION_MCP_ENABLED` | no | `true` | Permit the hosted Notion MCP entry when the active agent declares `notion` |
+| `CODEX_MEMORY_MCP_ENABLED` | no | `true` | Include memory MCP for Codex |
+| `CODEX_ISOLATED_HOME_PATH` | no | `data/codex-home` | Isolated Codex home directory |
+| `REPOS` | no | `[]` | JSON array of `RepoConfig`; `githubRepo` is the exact `owner/repo` identity used for PR URL routing (derived from a GitHub origin when omitted), and optional `githubUser` pins the local `gh` account for that repo |
+| `CHANNEL_DEFAULTS` | no | `{}` | JSON, validated Example mapping is `{"C0123456789":{"agentType":"lead"}}`. |
+| `SESSION_STORE` | no | `sqlite` | `sqlite` \| `memory` |
+| `SESSION_DB_PATH` | no | `data/sessions.db` | |
+| `SESSION_STALE_TIMEOUT_MS` | no | `86400000` | 24h |
+| `SESSION_CLEANUP_INTERVAL_MS` | no | `900000` | 15m |
+| `HOME_WINDOW_MS` | no | `172800000` | App Home visibility window (2 days) |
+| `SESSION_DEFAULT_VERBOSITY` | no | `normal` | `quiet` \| `normal` \| `verbose` |
+| `MEMORY_DB_PATH` | no | `data/memory.db` | associative memory DB used by live capture, CLI, and MCP memory tools |
+| `ADMIN_SLACK_USER_ID` | no | unset | bootstrap admin; further admins live in the `admins` SQLite table |
+| `HTTP_DASHBOARD_PORT` | no | unset | localhost dashboard; must be a positive integer 1–65535 or unset |
+| `MCP_PORT` | no | `3456` | internal Slack-bot MCP server |
+| `MEMORY_EMBED_PROVIDER` | no | `local` | `local` or deterministic `hashing` test provider |
+| `PRE_RECALL_ENABLED` | no | `false` | optional deterministic memory pre-recall before runner turns |
+| `PRE_RECALL_SYNTHESIS_ENABLED` | no | `false` | opt into bounded model synthesis over recalled candidates |
+| `WHATSAPP_ENABLED` | no | `false` | enable read-only WhatsApp archive ingestion/tools |
+| `SLACK_ARCHIVE_ENABLED` | no | `false` | enable passive live Slack archive capture and read-only MCP tools |
+| `SLACK_ARCHIVE_DB_PATH` | no | `data/slack-archive.db` | isolated Slack archive SQLite database |
+| `SLACK_ARCHIVE_EXPORT_PATH` | no | unset | default Slack export ZIP for the import CLI |
+| `SLACK_ARCHIVE_APPROVED_CHANNEL_IDS` | no | unset | comma-separated non-public channel IDs approved for archive capture/use |
+| `PIPELINE_RUNTIME_MODE` | no | `off` | `off`, `shadow`, or `active` |
+| `PRODUCT_PIPELINE_ENABLED` | no | `false` | typed product pipeline starts; requires active mode |
+| `BUG_PIPELINE_ENABLED` | no | `false` | typed bug pipeline starts; requires active mode |
+| `PIPELINE_RETENTION_DAYS` | no | `90` | terminal pipeline outbox retention |
+| `GITHUB_RECONCILE_ENABLED` | no | `false` | outbound read-only PR reconciliation |
+
+Validation rules (each throws on bad input):
+- `parseRunnerProvider` — accepts only the four implemented providers: `claude`, `opencode`, `opencode-sdk`, and `codex-app-server`.
+- `parseStoreKind` — must be `memory` or `sqlite`.
+- `parseVerbosity` — must be `quiet`/`normal`/`verbose`.
+- `parseChannelDefaults` — must be a JSON object of `{channelId: {agentType: string}}`.
+- `parseHttpDashboard` — unset/empty disables; otherwise must be an integer 1–65535.
+- OpenCode boolean env vars accept `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`.
+
+## Directory Structure
+
+```
+junior/
+  src/
+    index.ts              -- entry point: boot, wiring, intervals
+    config.ts             -- env loading + validation
+    logger.ts             -- structured logger
+    persona.ts            -- bot persona loader
+    slack/
+      app.ts              -- Bolt app (Socket Mode)
+      events.ts           -- event listeners, message routing
+      commands.ts         -- thread command parsing
+      formatting.ts       -- Slack formatting + NO_SLACK_MESSAGE sentinel handling
+      responder.ts        -- status/response posting
+      home.ts             -- App Home tab
+      files.ts            -- Slack file handling
+      thread-context.ts   -- prior-thread context extraction
+    session/
+      manager.ts          -- buffer/drain state machine
+      types.ts            -- ThreadSession, verbosity types
+      store/
+        interface.ts      -- SessionStore interface
+        factory.ts        -- createSessionStore(config)
+        memory.ts         -- InMemorySessionStore
+        sqlite.ts         -- SqliteSessionStore (bun:sqlite)
+    runners/
+      index.ts            -- normalized provider factory and dispatch
+      types.ts            -- provider-neutral SpawnResult/SpawnHandle contract
+    claude/
+      spawner.ts          -- Claude headless/tmux provider
+      driver.ts           -- Claude driver selection and lifecycle
+    opencode/
+      spawner.ts          -- OpenCode CLI provider
+      sdk-provider.ts     -- OpenCode SDK provider
+    codex-app-server/
+      provider.ts         -- Codex app-server provider
+    agents/
+      router.ts           -- agent definition routing
+      loader.ts           -- read .md files, parse frontmatter (incl. identity)
+    worktree/
+      manager.ts          -- create/remove/check worktrees in target repos
+    support/
+      router.ts           -- AgentDispatcher: per-agent persistent sessions
+      agents.ts           -- overlay identity loading + per-agent context profile
+    memory/               -- claim store, embeddings, recall, consolidation
+    pipelines/            -- typed product/bug control plane and outbox
+    workflows/            -- dynamic workflow registry, store, runner
+    github/               -- optional PR reconciliation
+    whatsapp/             -- optional read-only archive ingestion
+    mcp/
+      slack-server.ts     -- internal MCP server exposed to spawned sessions
+    http/
+      server.ts           -- localhost dashboard (HTTP_DASHBOARD_PORT)
+      routes/             -- dashboard route handlers
+    lifecycle/
+      shutdown.ts         -- graceful shutdown
+      health.ts           -- orphan detection
+      cleanup.ts          -- stale-session cleanup
+      timeout.ts          -- process timeout guard
+      process-utils.ts    -- shared spawn/kill helpers
+      dev-server.ts       -- per-repo dev-server manager
+      dev-server-queue.ts -- single-flight dev-server activation
+  .claude/
+    agents/               -- public agent definitions
+  agents-org/             -- private/overlay agents (identity in frontmatter)
+  data/
+    sessions.db           -- SQLite store (gitignored)
+  docs/
+    features/             -- feature docs
+    code_index/           -- code indexes per module
+  workflows/              -- release notes, worklog, memory consolidation, worktree prune
+  .env.example
+  package.json
+  tsconfig.json
+  CLAUDE.md
+  learnings.md
+```
+
+## Commands
+
+```bash
+bun run dev         # hot-reload dev server (--watch)
+bun run start       # production start
+bun run typecheck   # tsc --noEmit
+bun test            # bun's built-in test runner
+```
+
+## Shortcuts
+
+| Shortcut | Replaced in |
+|---|---|
+| Bun only (no Node fallback) | If Bun issues arise, switch to tsx + Node |
+| No production build step (run TS directly via Bun) | Post-MVP |
+| No CI/CD | Post-MVP |
+| JSON repo + channel config in env vars | Post-MVP (config file) |
+
+## Cut List (true v2)
+
+- Docker containerization
+- CI/CD pipeline (GitHub Actions)
+- Multi-environment config (dev/staging/prod)
+- Structured logging upgrade (pino or similar)
+- OpenTelemetry tracing

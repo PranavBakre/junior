@@ -1,0 +1,49 @@
+// Consolidation engine — offline write path (memory v3 §7). Barrel.
+
+export {
+  consolidateSession,
+  cosine,
+  DEFAULT_DEDUP_THRESHOLD,
+  type ConsolidateSessionArgs,
+} from "./consolidate.ts";
+export { buildConsolidationPrompt } from "./prompt.ts";
+export {
+  runPersonaConsolidationSweep,
+  DEFAULT_PERSONA_HISTORY_LIMIT,
+  DEFAULT_PERSONA_MIN_RECORDS,
+  type PersonaConsolidationReport,
+  type RunPersonaConsolidationSweepArgs,
+} from "./persona.ts";
+export {
+  runSubjectConsolidationSweep,
+  canonicalRepoSlug,
+  DEFAULT_SUBJECT_HISTORY_LIMIT,
+  DEFAULT_SUBJECT_MIN_RECORDS,
+  type RunSubjectConsolidationSweepArgs,
+  type SubjectConsolidationReport,
+} from "./subjects.ts";
+export {
+  createSlackPeopleResolver,
+  referencedSlackUserIds,
+  type PeopleResolver,
+} from "./identity.ts";
+export {
+  runConsolidationSweep,
+  summarizeConsolidationSweep,
+  DEFAULT_BODY_CAP,
+  DEFAULT_CONSOLIDATION_KINDS,
+  DEFAULT_MAX_BATCH_CHARS,
+  type ConsolidateV3Entry,
+  type RunConsolidationSweepArgs,
+} from "./sweep.ts";
+export {
+  consolidationOutputSchema,
+  type ClaimContextSample,
+  type ClaimDraft,
+  type ConsolidationContext,
+  type ConsolidationInvoke,
+  type ConsolidationOutput,
+  type ConsolidationReport,
+  type EpisodeDraft,
+  type ProfileDraft,
+} from "./types.ts";

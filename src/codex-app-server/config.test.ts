@@ -1,0 +1,261 @@
+import { describe, expect, it } from "bun:test";
+import { createSession } from "../session/types.ts";
+import { buildCodexConfigToml, buildCodexMcpConfig } from "./config.ts";
+import type { Config } from "../config.ts";
+
+describe("buildCodexMcpConfig", () => {
+  it("injects Slack MCP for trusted pipeline-start orchestrators", () => {
+    const session = createSession("t", "c");
+    session.activeAgentName = "lead";
+    session.agentPermissions = { intent: "normal", mcp: [], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toEqual({
+      "slack-bot": {
+        transport: "http",
+        url: expect.stringContaining(
+          "http://localhost:3456/mcp?agent=lead&channel=c&thread=t",
+        ),
+      },
+    });
+  });
+
+  it("builds only agent-declared MCP servers and honors utility carve-out", () => {
+    const session = createSession("t", "c");
+    session.agentPermissions = { intent: "normal", mcp: ["slack-bot", "playwright"], tools: [] };
+    const mcp = buildCodexMcpConfig(makeConfig(), session, true);
+
+    expect(mcp).toMatchObject({
+      "slack-bot": {
+        transport: "http",
+        url: expect.stringContaining("http://localhost:3456/mcp?agent=default&channel=c&thread=t"),
+      },
+      playwright: {
+        command: expect.stringContaining("junior-mcp-stdio-wrapper.js"),
+        args: ["--", "npx", "@playwright/mcp", "--headless"],
+      },
+    });
+    expect(buildCodexMcpConfig(makeConfig(), session, false)).toBeNull();
+  });
+
+  it("does not start local MCP servers when the agent declares none", () => {
+    const session = createSession("t", "c");
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toBeNull();
+  });
+
+  it("injects only Slack MCP for the trusted reviewer comment capability", () => {
+    const session = createSession("t", "c");
+    session.activeAgentName = "review";
+    session.agentPermissions = { intent: "read-only", mcp: [], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toMatchObject({
+      "slack-bot": {
+        transport: "http",
+        url: expect.stringContaining(
+          "http://localhost:3456/mcp?agent=review&channel=c&thread=t",
+        ),
+        tools: {
+          github_read_pr_review_state: { approval_mode: "approve" },
+          github_post_review: { approval_mode: "approve" },
+          pipeline_get_state: { approval_mode: "approve" },
+          pipeline_write_artifact: { approval_mode: "approve" },
+          pipeline_report_outcome: { approval_mode: "approve" },
+        },
+      },
+    });
+  });
+
+  it("auto-approves only declared MCP tools for read-only agents", () => {
+    const session = createSession("t", "c");
+    session.activeAgentName = "review";
+    session.agentPermissions = {
+      intent: "read-only",
+      mcp: ["slack-bot"],
+      tools: [
+        "mcp__slack-bot__memory_recall",
+        "mcp__slack-bot__slack_read_thread",
+      ],
+    };
+
+    const mcp = buildCodexMcpConfig(makeConfig(), session, true);
+    expect(mcp?.["slack-bot"]?.tools).toMatchObject({
+      memory_recall: { approval_mode: "approve" },
+      slack_read_thread: { approval_mode: "approve" },
+    });
+  });
+
+  it("does not bypass MCP approval for human-gated agents", () => {
+    const session = createSession("t", "c");
+    session.activeAgentName = "pm";
+    session.agentPermissions = {
+      intent: "human-gated",
+      mcp: ["slack-bot"],
+      tools: ["mcp__slack-bot__memory_recall"],
+    };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)?.["slack-bot"]?.tools)
+      .toBeUndefined();
+  });
+
+  it("limits MCP servers to explicitly declared agent permissions", () => {
+    const session = createSession("t", "c");
+    session.agentPermissions = { intent: "normal", mcp: ["playwright"], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toEqual({
+      playwright: {
+        command: expect.stringContaining("junior-mcp-stdio-wrapper.js"),
+        args: ["--", "npx", "@playwright/mcp", "--headless"],
+      },
+    });
+  });
+
+  it("uses Junior's MongoDB HTTP proxy instead of spawning local MongoDB MCP", () => {
+    const session = createSession("t", "c");
+    session.agentPermissions = { intent: "normal", mcp: ["mongodb"], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toEqual({
+      mongodb: {
+        transport: "http",
+        url: expect.stringContaining("http://localhost:3456/mcp/mongodb?agent=default&channel=c&thread=t"),
+      },
+    });
+  });
+
+  it("injects the read-only MongoDB proxy from a trusted agent capability", () => {
+    const session = createSession("t", "c");
+    session.activeAgentName = "onboard-member";
+    session.agentPermissions = { intent: "read-only", mcp: [], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toMatchObject({
+      mongodb: {
+        transport: "http",
+        url: expect.stringContaining(
+          "http://localhost:3456/mcp/mongodb?agent=onboard-member&channel=c&thread=t",
+        ),
+      },
+      "slack-bot": expect.any(Object),
+    });
+  });
+
+  it("keeps hosted OAuth MCPs capability-scoped", () => {
+    const session = createSession("t", "c");
+    session.agentPermissions = { intent: "normal", mcp: ["figma", "notion"], tools: [] };
+
+    expect(buildCodexMcpConfig(makeConfig(), session, true)).toEqual({
+      figma: {
+        transport: "http",
+        url: "https://mcp.figma.com/mcp",
+      },
+      notion: {
+        transport: "http",
+        url: "https://mcp.notion.com/mcp",
+      },
+    });
+  });
+
+  it("respects hosted OAuth MCP feature flags", () => {
+    const session = createSession("t", "c");
+    session.agentPermissions = { intent: "normal", mcp: ["figma"], tools: [] };
+    const config = makeConfig();
+    config.codex.figmaMcpEnabled = false;
+
+    expect(buildCodexMcpConfig(config, session, true)).toBeNull();
+  });
+});
+
+describe("buildCodexConfigToml", () => {
+  it("serializes minimal isolated Codex config", () => {
+    const configWithMcp = buildCodexConfigToml({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      mcp: {
+        "slack-bot": {
+          transport: "http",
+          url: "http://localhost:3456/mcp",
+          tools: {
+            memory_recall: { approval_mode: "approve" },
+          },
+        },
+      },
+      trustedProjectPath: "/repo",
+    });
+    expect(configWithMcp).toContain('[projects."/repo"]\ntrust_level = "trusted"');
+    expect(configWithMcp).toContain(
+      '[mcp_servers.slack-bot.tools.memory_recall]\napproval_mode = "approve"',
+    );
+    const config = buildCodexConfigToml({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      mcp: null,
+    });
+    expect(config).toContain('model_reasoning_effort = "medium"');
+    expect(config).toContain('sandbox_mode = "danger-full-access"');
+    expect(config).toContain("[features]\nmulti_agent = false");
+    expect(config).toContain("multi_agent = false\napps = false");
+  });
+});
+
+function makeConfig(): Config {
+  return {
+    slack: { botToken: "xoxb", appToken: "xapp", signingSecret: "" },
+    claude: {
+      maxTurns: 25,
+      timeoutMs: 300000,
+      permissionMode: "bypassPermissions",
+      defaultModel: null,
+      defaultDriver: "headless",
+      tmuxIdleTtlMs: 1,
+      tmuxSweepIntervalMs: 1,
+    },
+    runner: { provider: "codex-app-server" },
+    opencode: {
+      model: null,
+      timeoutMs: 300000,
+      continuityEnabled: false,
+      permission: "allow",
+      mcpEnabled: true,
+      slackMcpEnabled: true,
+      playwrightMcpEnabled: true,
+      mixpanelMcpEnabled: true,
+      mongodbMcpEnabled: true,
+    },
+    codex: {
+      mode: "app-server",
+      model: null,
+      timeoutMs: 300000,
+      sandbox: "workspace-write",
+      askForApproval: "never",
+      searchEnabled: false,
+      appServerContinuityEnabled: false,
+      mcpEnabled: true,
+      slackMcpEnabled: true,
+      playwrightMcpEnabled: true,
+      mixpanelMcpEnabled: true,
+      mongodbMcpEnabled: true,
+      memoryMcpEnabled: true,
+      isolatedHomePath: "data/codex-home",
+    },
+    repos: [],
+    session: {
+      staleTimeoutMs: 1,
+      cleanupIntervalMs: 1,
+      store: "memory",
+      sqlitePath: ":memory:",
+      homeWindowMs: 1,
+      defaultVerbosity: "normal",
+      idleTimeoutMs: 1,
+      maxIdleInterrupts: 1,
+      shortFollowupInterruptEnabled: false,
+      shortFollowupMaxLength: 280,
+    },
+    memory: { sqlitePath: "data/memory.db" },
+    threadArchives: { dir: "data/thread-archives" },
+    channelDefaults: {},
+    adminSlackUserId: null,
+    http: { enabled: false, port: 0 },
+  };
+}
